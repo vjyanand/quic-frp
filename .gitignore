@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+rathole.toml
+server.toml
+client.toml
+**/*.txt
+.vscode

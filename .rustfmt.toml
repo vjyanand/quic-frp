@@ -1,0 +1,7 @@
+max_width = 90
+hard_tabs = false
+tab_spaces = 2
+single_line_if_else_max_width = 90
+single_line_let_else_max_width = 90
+reorder_imports = true
+use_small_heuristics = "Max"

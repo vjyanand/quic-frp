@@ -1,0 +1,3 @@
+[build]
+rustflags = ["--cfg=io_uring_skip_arch_check"]
+
