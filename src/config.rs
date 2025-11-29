@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::path::PathBuf;
+
 use bincode::{Decode, Encode, encode_to_vec};
 use compio_quic::{RecvStream, SendStream};
 use log::trace;
@@ -23,6 +25,8 @@ pub struct ClientConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
   pub listen_addr: String,
+  pub cert: Option<PathBuf>,
+  pub key: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

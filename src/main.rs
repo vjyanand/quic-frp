@@ -3,6 +3,7 @@ use clap::Parser;
 use crate::{cli::Cli, client::run_client, config::Config, server::run_server};
 
 mod backoff;
+mod tls;
 mod cli;
 mod client;
 mod config;

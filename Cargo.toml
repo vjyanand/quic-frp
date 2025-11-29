@@ -15,7 +15,7 @@ compio = { version = "0.16.1", features = [
     "rustls"
 ] }
 compio-net = "0.9.0"
-compio-quic = {version ="0.5.1", features=[ "native-certs", "platform-verifier"]}
+compio-quic = { version = "0.5.1", default-features = false, features = ["ring", "native-certs", "platform-verifier"] }
 compio-signal = "0.7.0"
 config = "0.15.19"
 dashmap = "6.1.0"
@@ -24,6 +24,8 @@ futures = "0.3.31"
 log = "0.4.28"
 notify = "8.2.0"
 rcgen = "0.14.5"
+rustls = { version = "0.23.35", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2.2.0"
 serde = {version = "1.0.228", features=["serde_derive"]}
 socket2 = "0.6.1"
 toml = "0.9.8"

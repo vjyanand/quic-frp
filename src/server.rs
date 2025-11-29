@@ -13,10 +13,30 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::{
   config::{ServerConfig, ServiceDefinition, control_read_frame, control_write_frame},
   protocol::{ClientControlMessage, ServerControlMessage},
+  tls::TlsCertConfig,
 };
 
 type RuntimeHandle = compio::runtime::JoinHandle<()>;
 type PortRegistry = Arc<DashMap<u16, PortBinding>>;
+
+static BIND_ADDR_TYPE: std::sync::OnceLock<BindAddrType> = std::sync::OnceLock::new();
+
+#[derive(Debug)]
+enum BindAddrType {
+  Ipv4,      // 0.0.0.0
+  Ipv6,      // [::]
+  DualStack, // [::] with dual-stack enabled
+}
+
+impl BindAddrType {
+  fn detect(addr: &SocketAddr) -> Self {
+    match addr {
+      SocketAddr::V4(_) => Self::Ipv4,
+      SocketAddr::V6(v6) if v6.ip().is_unspecified() => Self::DualStack,
+      SocketAddr::V6(_) => Self::Ipv6,
+    }
+  }
+}
 
 #[derive(Clone)]
 struct ClientIdentity {
@@ -76,19 +96,14 @@ struct PortBinding {
 pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
   info!("Server starting on {}", config.listen_addr);
 
-  // Generate self-signed certificate for QUIC TLS
-  let rcgen::CertifiedKey { cert, signing_key } =
-    rcgen::generate_simple_self_signed(vec!["localhost".into()])
-      .map_err(|e| anyhow::anyhow!("Failed to generate certificate: {}", e))?;
-
-  let cert_der = cert.der().clone();
-  let key_der = signing_key
-    .serialize_der()
-    .try_into()
-    .map_err(|_| anyhow::anyhow!("Failed to serialize private key"))?;
+  let (cert_der, key_der) = if config.cert.is_some() && config.key.is_some() {
+    TlsCertConfig::from_pem_files(config.cert.unwrap(), config.key.unwrap()).load()?
+  } else {
+    TlsCertConfig::self_signed(vec!["localhost".to_owned()]).load()?
+  };
 
   // Configure QUIC server
-  let mut server_config = ServerBuilder::new_with_single_cert(vec![cert_der], key_der)
+  let mut server_config = ServerBuilder::new_with_single_cert(cert_der, key_der)
     .map_err(|e| anyhow::anyhow!("Failed to create server config: {}", e))?
     .with_alpn_protocols(&["quic-proxy"])
     .build();
@@ -97,10 +112,15 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
 
   // Bind UDP socket with socket2 for advanced options
   let bind_addr: SocketAddr = config.listen_addr.parse()?;
+  let _ = BIND_ADDR_TYPE.set(BindAddrType::detect(&bind_addr));
   let socket = create_udp_socket(bind_addr)?;
   let endpoint = create_endpoint(socket, server_config)?;
 
-  info!("Server listening on {}", endpoint.local_addr()?);
+  info!(
+    "Server listening on {} bind mode {:?}",
+    endpoint.local_addr()?,
+    BIND_ADDR_TYPE.get()
+  );
 
   // Accept QUIC connections indefinitely
   accept_connections(endpoint).await?;
@@ -294,8 +314,6 @@ async fn handle_register_service(
         def.remote_port, old_binding.client_identity, old_binding.service_name
       );
       old_binding.runtime_handle.cancel().await;
-      compio::time::sleep(Duration::from_millis(50)).await;
-      debug!("Cancelled listener for port {}", def.remote_port);
     }
   }
 
@@ -501,10 +519,16 @@ async fn create_tcp_listener_with_retry(
   service: &ServiceDefinition,
   max_retries: u32,
 ) -> anyhow::Result<TcpListener> {
-  let bind_addr = format!("0.0.0.0:{}", service.remote_port);
+  let bind_addr = match BIND_ADDR_TYPE.get_or_init(|| BindAddrType::Ipv4) {
+    BindAddrType::Ipv4 => format!("0.0.0.0:{}", service.remote_port),
+    BindAddrType::DualStack | BindAddrType::Ipv6 => {
+      format!("[::]:{}", service.remote_port)
+    }
+  };
   let opts = TcpOpts::new()
     .nodelay(true)
     .keepalive(true)
+    .reuse_port(true)
     .write_timeout(Duration::from_secs(2))
     .read_timeout(Duration::from_secs(2));
 
