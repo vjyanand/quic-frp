@@ -5,3 +5,5 @@ server.toml
 client.toml
 **/*.txt
 .vscode
+/.idea
+.DS_Store

@@ -11,7 +11,10 @@ use log::{debug, error, info, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::{
-  config::{ServerConfig, ServiceDefinition, control_read_frame, control_write_frame},
+  config::{
+    ServerConfig, ServiceDefinition, VERSION_MAJOR, control_read_frame,
+    control_write_frame,
+  },
   protocol::{ClientControlMessage, ServerControlMessage},
   tls::TlsCertConfig,
 };
@@ -102,10 +105,16 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     TlsCertConfig::self_signed(vec!["localhost".to_owned()]).load()?
   };
 
+  let alpn = if let Some(token) = config.token {
+    format!("quic-proxy-{}-{}", VERSION_MAJOR, token)
+  } else {
+    format!("quic-proxy-{}", VERSION_MAJOR)
+  };
+
   // Configure QUIC server
   let mut server_config = ServerBuilder::new_with_single_cert(cert_der, key_der)
     .map_err(|e| anyhow::anyhow!("Failed to create server config: {}", e))?
-    .with_alpn_protocols(&["quic-proxy"])
+    .with_alpn_protocols(&[&alpn])
     .build();
 
   server_config.transport_config(create_transport_config()?);

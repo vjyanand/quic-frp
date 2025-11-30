@@ -17,7 +17,6 @@ compio = { version = "0.16.1", features = [
 compio-net = "0.9.0"
 compio-quic = { version = "0.5.1", default-features = false, features = ["ring", "native-certs", "platform-verifier"] }
 compio-signal = "0.7.0"
-config = "0.15.19"
 dashmap = "6.1.0"
 env_logger = "0.11.8"
 futures = "0.3.31"

@@ -19,7 +19,7 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::{
   backoff::ExponentialBackoff,
-  config::{ClientConfig, Config, ServiceDefinition},
+  config::{ClientConfig, Config, ServiceDefinition, VERSION_MAJOR},
   protocol::{
     ClientControlMessage, ServerControlMessage, read_frame, read_port_header, write_frame,
   },
@@ -49,9 +49,15 @@ pub async fn run_client(config: ClientConfig, config_path: &str) -> anyhow::Resu
   for svc in &config.services {
     services.insert(svc.remote_port, svc.clone());
   }
+
+  let alpn = if let Some(token) = config.token {
+    format!("quic-proxy-{}-{}", VERSION_MAJOR, token)
+  } else {
+    format!("quic-proxy-{}", VERSION_MAJOR)
+  };
   // Main reconnection loop
   loop {
-    match connect_to_server(&endpoint, server_addr, &transport_config).await {
+    match connect_to_server(&endpoint, server_addr, &alpn, &transport_config).await {
       Ok(conn) => {
         info!("Connected to server");
         backoff.reset();
@@ -133,11 +139,11 @@ fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>
 async fn connect_to_server(
   endpoint: &Endpoint,
   server_addr: SocketAddr,
+  alpn: &str,
   transport_config: &Arc<compio_quic::TransportConfig>,
 ) -> anyhow::Result<Connection> {
-  let mut client_config = ClientBuilder::new_with_no_server_verification()
-    .with_alpn_protocols(&["quic-proxy"])
-    .build();
+  let mut client_config =
+    ClientBuilder::new_with_no_server_verification().with_alpn_protocols(&[alpn]).build();
 
   client_config.transport_config(transport_config.clone());
 

@@ -7,6 +7,8 @@ use compio_quic::{RecvStream, SendStream};
 use log::trace;
 use serde::{Deserialize, Serialize};
 
+pub const VERSION_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
+
 #[derive(Debug, Clone, Encode, Decode, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct ServiceDefinition {
   pub service_name: String,
@@ -19,6 +21,7 @@ pub struct ClientConfig {
   pub remote_addr: String,
   pub prefer_ipv6: Option<bool>,
   pub retry_interval: Option<u64>,
+  pub token: Option<String>,
   pub services: Vec<ServiceDefinition>,
 }
 
@@ -27,6 +30,7 @@ pub struct ServerConfig {
   pub listen_addr: String,
   pub cert: Option<PathBuf>,
   pub key: Option<PathBuf>,
+  pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
