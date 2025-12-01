@@ -11,11 +11,8 @@ use log::{debug, error, info, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::{
-  config::{
-    ServerConfig, ServiceDefinition, VERSION_MAJOR, control_read_frame,
-    control_write_frame,
-  },
-  protocol::{ClientControlMessage, ServerControlMessage},
+  config::{ServerConfig, ServiceDefinition, VERSION_MAJOR},
+  protocol::{ClientControlMessage, ServerControlMessage, read_frame, write_frame},
   tls::TlsCertConfig,
 };
 
@@ -228,7 +225,7 @@ async fn handle_quic_connection(
   debug!("Control stream established for {}", client_identity);
 
   loop {
-    match control_read_frame::<ClientControlMessage>(&mut control_recv).await {
+    match read_frame::<ClientControlMessage>(&mut control_recv).await {
       Ok(ClientControlMessage::RegisterService(def)) => {
         if let Err(e) = handle_register_service(
           def,
@@ -282,7 +279,7 @@ async fn handle_register_service(
           success: true,
           error: Some("Already registered".to_string()),
         };
-        control_write_frame(control_send, &ack).await?;
+        write_frame(control_send, &ack).await?;
         return Ok(());
       } else if client_identity.is_same_client(&existing.client_identity) {
         // Same client, different connection (reconnect) - take over
@@ -304,7 +301,7 @@ async fn handle_register_service(
             def.remote_port
           )),
         };
-        control_write_frame(control_send, &ack).await?;
+        write_frame(control_send, &ack).await?;
         return Ok(());
       }
     } else {
@@ -338,7 +335,7 @@ async fn handle_register_service(
         success: false,
         error: Some(format!("{}", e)),
       };
-      control_write_frame(control_send, &ack).await?;
+      write_frame(control_send, &ack).await?;
       return Ok(());
     }
   };
@@ -380,7 +377,7 @@ async fn handle_register_service(
     success: true,
     error: None,
   };
-  control_write_frame(control_send, &ack).await?;
+  write_frame(control_send, &ack).await?;
 
   Ok(())
 }
@@ -425,7 +422,7 @@ async fn handle_unregister_service(
       Some("Port not owned by this connection".to_string())
     },
   };
-  control_write_frame(control_send, &ack).await?;
+  write_frame(control_send, &ack).await?;
 
   Ok(())
 }
