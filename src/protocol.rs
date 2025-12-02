@@ -6,7 +6,7 @@
 
 use bincode::{Decode, Encode, encode_to_vec};
 use compio_quic::{RecvStream, SendStream};
-use log::trace;
+use tracing::trace;
 
 use crate::config::ServiceDefinition;
 

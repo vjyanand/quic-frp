@@ -14,8 +14,8 @@ use compio_quic::{
 use compio_signal::ctrl_c;
 use dashmap::DashMap;
 use futures::future::{Either, select};
-use log::{debug, info, warn};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
   backoff::ExponentialBackoff,
@@ -128,9 +128,9 @@ fn resolve_server_addr(
 fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>> {
   let mut config = compio_quic::TransportConfig::default();
 
-  config.keep_alive_interval(Some(Duration::from_secs(5)));
-  config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(20))?));
-  config.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
+  config.keep_alive_interval(Some(Duration::from_secs(30)));
+  config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(60))?));
+  config.max_concurrent_bidi_streams(VarInt::from_u64(10)?);
 
   Ok(Arc::new(config))
 }
@@ -163,7 +163,7 @@ async fn handle_connection(
   config_path: &str,
 ) -> anyhow::Result<LoopControl> {
   // Open control stream (first bidirectional stream)
-  let (mut ctrl_send, ctrl_recv) = conn.open_bi()?;
+  let (mut ctrl_send, mut ctrl_recv) = conn.open_bi()?;
   debug!("Control stream opened");
 
   // Register all current services
@@ -178,9 +178,9 @@ async fn handle_connection(
 
   // Spawn task to receive control messages (acks)
   // Returns when control stream closes (connection lost)
-  let mut ctrl_recv_owned = ctrl_recv;
+
   let quic_ctrl_task = compio::runtime::spawn(async move {
-    receive_control_messages(&mut ctrl_recv_owned).await;
+    receive_control_messages(&mut ctrl_recv).await;
     // Signal that connection is dead
     true
   });
@@ -460,13 +460,15 @@ async fn handle_data_stream(
   debug!("Proxying to local service: {} ({})", service.service_name, service.local_addr);
 
   // Connect to local service
-  let opts = TcpOpts::new().nodelay(true).keepalive(true);
+  let opts =
+    TcpOpts::new().nodelay(true).keepalive(true).write_timeout(Duration::from_secs(2));
   let local_tcp = TcpStream::connect_with_options(&service.local_addr, opts).await?;
 
   debug!("Connected to local service: {}", service.local_addr);
 
   // Bidirectional proxy
-  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv).await
+  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv).await;
+  Ok(())
 }
 
 /// Copy data bidirectionally between TCP and QUIC streams
@@ -475,7 +477,7 @@ async fn proxy_quic_to_tcp(
   tcp: TcpStream,
   quic_send: &mut SendStream,
   quic_recv: &mut RecvStream,
-) -> anyhow::Result<()> {
+) {
   let (mut tcp_r, mut tcp_w) = tcp.split();
 
   // Local TCP -> QUIC (upstream to server)
@@ -488,9 +490,11 @@ async fn proxy_quic_to_tcp(
 
   // QUIC -> Local TCP (downstream from server)
   let downstream = async {
-    copy(quic_recv, &mut tcp_w).await
+    let res = copy(quic_recv, &mut tcp_w).await;
     // When this returns, server closed their send side (external client disconnected)
     // TCP write half will be dropped, signaling EOF to local service
+    trace!("send side (external client disconnected)");
+    res
   };
 
   let upstream = pin!(upstream);
@@ -515,6 +519,4 @@ async fn proxy_quic_to_tcp(
       }
     }
   }
-
-  Ok(())
 }

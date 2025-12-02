@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use log::debug;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tracing::debug;
 
 pub enum TlsCertConfig {
   SelfSigned {

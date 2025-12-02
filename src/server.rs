@@ -7,8 +7,8 @@ use compio_quic::{
 };
 use dashmap::DashMap;
 use futures::future::{Either, select};
-use log::{debug, error, info, warn};
 use socket2::{Domain, Protocol, Socket, Type};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
   config::{ServerConfig, ServiceDefinition, VERSION_MAJOR},
@@ -125,7 +125,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
   info!(
     "Server listening on {} bind mode {:?}",
     endpoint.local_addr()?,
-    BIND_ADDR_TYPE.get()
+    BIND_ADDR_TYPE.get().unwrap()
   );
 
   // Accept QUIC connections indefinitely
@@ -139,7 +139,7 @@ fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>
   let mut transport = compio_quic::TransportConfig::default();
 
   // Keep-alive to detect dead connections
-  transport.keep_alive_interval(Some(Duration::from_secs(5)));
+  transport.keep_alive_interval(Some(Duration::from_secs(30)));
 
   // Longer idle timeout for server (handles multiple clients)
   transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(60))?));
@@ -362,6 +362,7 @@ async fn handle_register_service(
     }
   });
 
+  debug!("Adding to registry for {}", def.service_name);
   // Track in global registry
   registry.insert(
     def.remote_port,
@@ -371,13 +372,14 @@ async fn handle_register_service(
       runtime_handle: accept_task,
     },
   );
-
+  debug!("Sending registration ACK to client {}", def.service_name);
   let ack = ServerControlMessage::ServiceRegistered {
     service_name: def.service_name,
     success: true,
     error: None,
   };
   write_frame(control_send, &ack).await?;
+  debug!("Sent registration ACK to client");
 
   Ok(())
 }
@@ -482,7 +484,6 @@ async fn handle_tcp_connection(
     .map_err(|e| anyhow::anyhow!("Failed to write port header: {}", e))?;
 
   proxy_tcp_to_quic(tcp_stream, &mut quic_send, &mut quic_recv).await?;
-
   debug!("TCP connection {} closed", peer_addr);
   Ok(())
 }
@@ -496,7 +497,10 @@ async fn proxy_tcp_to_quic(
 
   let upstream = async {
     let result = copy(&mut tcp_r, quic_send).await;
-    let _ = quic_send.finish();
+    match quic_send.finish() {
+      Ok(()) => trace!("called QUIC send finish"),
+      Err(err) => trace!("error calling QUIC send finish {}", err),
+    }
     result
   };
 

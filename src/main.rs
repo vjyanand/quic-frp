@@ -1,5 +1,6 @@
 use clap::Parser;
-use log::debug;
+use tracing::{Level, debug};
+use tracing_subscriber::FmtSubscriber;
 
 use crate::{cli::Cli, client::run_client, config::Config, server::run_server};
 
@@ -13,7 +14,10 @@ mod tls;
 
 #[compio::main]
 async fn main() -> anyhow::Result<()> {
-  env_logger::init();
+  let subscriber = FmtSubscriber::builder().with_max_level(Level::TRACE).finish();
+  tracing::subscriber::set_global_default(subscriber)
+    .expect("setting default subscriber failed");
+  
   let cli = Cli::try_parse()?;
   debug!("Using config file {}", cli.config);
   let config = Config::load(&cli.config)?;
