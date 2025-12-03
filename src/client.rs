@@ -322,7 +322,7 @@ async fn handle_config_reload(
   // Unregister removed services
   for port in to_remove {
     if let Some((_, svc)) = services.remove(&port) {
-      info!("Unregistering removed service: {}", svc.service_name);
+      info!("Unregistering removed service: {}", svc.name);
       write_frame(ctrl_send, &ClientControlMessage::UnregisterService(svc.clone()))
         .await?;
     }
@@ -330,7 +330,7 @@ async fn handle_config_reload(
 
   // Register new services and add to registry
   for svc in to_add {
-    info!("Registering new service: {}", svc.service_name);
+    info!("Registering new service: {}", svc.name);
     write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone())).await?;
     services.insert(svc.remote_port, svc);
   }
@@ -342,7 +342,7 @@ async fn handle_config_reload(
     {
       info!(
         "Updating service {} local_addr: {} -> {}",
-        new_svc.service_name,
+        new_svc.name,
         entry.value().local_addr,
         new_svc.local_addr
       );
@@ -365,9 +365,9 @@ async fn register_services(
   for svc in services.iter() {
     let msg = ClientControlMessage::RegisterService(svc.clone());
     if let Err(e) = write_frame(ctrl_send, &msg).await {
-      warn!("Failed to register {}: {}", svc.service_name, e);
+      warn!("Failed to register {}: {}", svc.name, e);
     } else {
-      debug!("Sent register for {}", svc.service_name);
+      debug!("Sent register for {}", svc.name);
     }
   }
   Ok(())
@@ -457,7 +457,7 @@ async fn handle_data_stream(
     )
   })?;
 
-  debug!("Proxying to local service: {} ({})", service.service_name, service.local_addr);
+  debug!("Proxying to local service: {} ({})", service.name, service.local_addr);
 
   // Connect to local service
   let opts =

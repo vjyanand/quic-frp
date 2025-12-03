@@ -88,7 +88,7 @@ impl std::fmt::Display for ClientIdentity {
 
 struct PortBinding {
   client_identity: ClientIdentity,
-  service_name: String,
+  name: String,
   runtime_handle: RuntimeHandle,
 }
 
@@ -306,7 +306,7 @@ async fn handle_register_service(
           def.remote_port, client_identity
         );
         let ack = ServerControlMessage::ServiceRegistered {
-          service_name: def.service_name,
+          service_name: def.name,
           success: true,
           error: Some("Already registered".to_string()),
         };
@@ -322,10 +322,10 @@ async fn handle_register_service(
           def.remote_port,
           client_identity,
           existing.client_identity,
-          existing.service_name
+          existing.name
         );
         let ack = ServerControlMessage::ServiceRegistered {
-          service_name: def.service_name,
+          service_name: def.name,
           success: false,
           error: Some(format!(
             "Port {} is already in use by another client",
@@ -348,7 +348,7 @@ async fn handle_register_service(
     if let Some((_, old_binding)) = registry.remove(&def.remote_port) {
       debug!(
         "Cancelling listener for port {} (client={}, service={})",
-        def.remote_port, old_binding.client_identity, old_binding.service_name
+        def.remote_port, old_binding.client_identity, old_binding.name
       );
       old_binding.runtime_handle.cancel().await;
     }
@@ -362,7 +362,7 @@ async fn handle_register_service(
         def.remote_port, client_identity, e
       );
       let ack = ServerControlMessage::ServiceRegistered {
-        service_name: def.service_name,
+        service_name: def.name,
         success: false,
         error: Some(format!("{}", e)),
       };
@@ -373,7 +373,7 @@ async fn handle_register_service(
 
   info!(
     "Created listener for service '{}' on port {} for {}",
-    def.service_name, def.remote_port, client_identity
+    def.name, def.remote_port, client_identity
   );
 
   let l_client_identity = client_identity.clone();
@@ -393,19 +393,19 @@ async fn handle_register_service(
     }
   });
 
-  debug!("Adding to registry for {}", def.service_name);
+  debug!("Adding to registry for {}", def.name);
   // Track in global registry
   registry.insert(
     def.remote_port,
     PortBinding {
       client_identity: client_identity.clone(),
-      service_name: def.service_name.clone(),
+      name: def.name.clone(),
       runtime_handle: accept_task,
     },
   );
-  debug!("Sending registration ACK to client {}", def.service_name);
+  debug!("Sending registration ACK to client {}", def.name);
   let ack = ServerControlMessage::ServiceRegistered {
-    service_name: def.service_name,
+    service_name: def.name,
     success: true,
     error: None,
   };
@@ -432,7 +432,7 @@ async fn handle_unregister_service(
         binding.runtime_handle.cancel().await;
         info!(
           "Unregistered service '{}' on port {} for {}",
-          def.service_name, def.remote_port, client_identity
+          def.name, def.remote_port, client_identity
         );
         success = true;
       }
@@ -447,7 +447,7 @@ async fn handle_unregister_service(
   }
 
   let ack = ServerControlMessage::ServiceUnregistered {
-    service_name: def.service_name,
+    service_name: def.name,
     success,
     error: if success {
       None
@@ -468,7 +468,7 @@ async fn accept_tcp_connections(
   let port = service.remote_port;
   info!(
     "Accepting TCP connections on port {} for service '{}'",
-    port, service.service_name
+    port, service.name
   );
 
   loop {
@@ -623,7 +623,7 @@ async fn cleanup_listeners(registry: &PortRegistry, client: &ClientIdentity) {
         drop(entry);
         if let Some((_, binding)) = registry.remove(&port) {
           binding.runtime_handle.cancel().await;
-          debug!("Cleaned up port {} (service: {})", port, binding.service_name);
+          debug!("Cleaned up port {} (service: {})", port, binding.name);
           cleaned += 1;
         }
       } else {
