@@ -14,7 +14,7 @@ mod tls;
 
 #[compio::main]
 async fn main() -> anyhow::Result<()> {
-  let subscriber = FmtSubscriber::builder().with_max_level(Level::TRACE).finish();
+  let subscriber = FmtSubscriber::builder().with_max_level(Level::WARN).finish();
   tracing::subscriber::set_global_default(subscriber)
     .expect("setting default subscriber failed");
   

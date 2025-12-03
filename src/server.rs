@@ -187,27 +187,6 @@ fn create_udp_socket(bind_addr: SocketAddr) -> anyhow::Result<std::net::UdpSocke
     } else {
       debug!("UDP_GRO enabled successfully");
     }
-
-    // Also try UDP_SEGMENT for GSO (Generic Segmentation Offload)
-    const UDP_SEGMENT: libc::c_int = 103;
-    let result = unsafe {
-      libc::setsockopt(
-        socket.as_raw_fd(),
-        libc::SOL_UDP,
-        UDP_SEGMENT,
-        &enable as *const _ as *const libc::c_void,
-        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-      )
-    };
-
-    if result != 0 {
-      warn!(
-        "Failed to enable UDP_SEGMENT (may not be supported): {}",
-        std::io::Error::last_os_error()
-      );
-    } else {
-      debug!("UDP_SEGMENT enabled successfully");
-    }
   }
   socket.bind(&bind_addr.into())?;
   Ok(socket.into())
