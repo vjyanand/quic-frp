@@ -19,6 +19,7 @@ compio-quic = { version = "0.6.0", default-features = false, features = ["ring",
 compio-signal = "0.8.0"
 dashmap = "6.1.0"
 futures = "0.3.31"
+libc = "0.2.178"
 notify = "8.2.0"
 rcgen = "0.14.5"
 rustls = { version = "0.23.35", default-features = false, features = ["ring", "tls12"] }

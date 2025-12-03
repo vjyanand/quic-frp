@@ -157,6 +157,58 @@ fn create_udp_socket(bind_addr: SocketAddr) -> anyhow::Result<std::net::UdpSocke
 
   socket.set_nonblocking(true)?;
   socket.set_keepalive(true)?;
+
+  // Increase buffer sizes significantly (2MB each)
+  socket.set_recv_buffer_size(2 * 1024 * 1024)?;
+  socket.set_send_buffer_size(2 * 1024 * 1024)?;
+
+  #[cfg(target_os = "linux")]
+  {
+    // Enable UDP GRO for receive offload (Linux-specific)
+    use std::os::fd::AsRawFd;
+    const UDP_GRO: libc::c_int = 104;
+    let enable: libc::c_int = 1;
+
+    let result = unsafe {
+      libc::setsockopt(
+        socket.as_raw_fd(),
+        libc::SOL_UDP,
+        UDP_GRO,
+        &enable as *const _ as *const libc::c_void,
+        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+      )
+    };
+
+    if result != 0 {
+      warn!(
+        "Failed to enable UDP_GRO (may not be supported): {}",
+        std::io::Error::last_os_error()
+      );
+    } else {
+      debug!("UDP_GRO enabled successfully");
+    }
+
+    // Also try UDP_SEGMENT for GSO (Generic Segmentation Offload)
+    const UDP_SEGMENT: libc::c_int = 103;
+    let result = unsafe {
+      libc::setsockopt(
+        socket.as_raw_fd(),
+        libc::SOL_UDP,
+        UDP_SEGMENT,
+        &enable as *const _ as *const libc::c_void,
+        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+      )
+    };
+
+    if result != 0 {
+      warn!(
+        "Failed to enable UDP_SEGMENT (may not be supported): {}",
+        std::io::Error::last_os_error()
+      );
+    } else {
+      debug!("UDP_SEGMENT enabled successfully");
+    }
+  }
   socket.bind(&bind_addr.into())?;
   Ok(socket.into())
 }
