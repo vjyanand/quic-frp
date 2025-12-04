@@ -8,7 +8,7 @@ use compio_quic::{
 use dashmap::DashMap;
 use futures::future::{Either, select};
 use socket2::{Domain, Protocol, Socket, Type};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
   config::{ServerConfig, ServiceDefinition, VERSION_MAJOR},
@@ -20,6 +20,13 @@ type RuntimeHandle = compio::runtime::JoinHandle<()>;
 type PortRegistry = Arc<DashMap<u16, PortBinding>>;
 
 static BIND_ADDR_TYPE: std::sync::OnceLock<BindAddrType> = std::sync::OnceLock::new();
+
+enum RegisterServiceResult {
+  Registered(TcpListener),
+  AllReadyRegistred(String),
+  UnSolicited(String),
+  OSError(String),
+}
 
 #[derive(Debug)]
 enum BindAddrType {
@@ -44,8 +51,8 @@ struct ClientIdentity {
   identifier: uuid::Uuid,
 }
 
-impl ClientIdentity {
-  fn from_socket_addr(addr: SocketAddr) -> Self {
+impl From<SocketAddr> for ClientIdentity {
+  fn from(addr: SocketAddr) -> Self {
     let remote_ip = match addr.ip() {
       std::net::IpAddr::V6(v6) => {
         if let Some(v4) = v6.to_ipv4_mapped() {
@@ -58,7 +65,9 @@ impl ClientIdentity {
     };
     Self { remote_ip, identifier: uuid::Uuid::new_v4() }
   }
+}
 
+impl ClientIdentity {
   /// Check if this is the same logical client (same IP, possibly different connection)
   fn is_same_client(&self, other: &ClientIdentity) -> bool {
     self.remote_ip == other.remote_ip
@@ -69,7 +78,6 @@ impl ClientIdentity {
     self.remote_ip == other.remote_ip && self.identifier == other.identifier
   }
 
-  /// Get all ports owned by this specific connection
   fn get_ports(&self, registry: &PortRegistry) -> Vec<u16> {
     registry
       .iter()
@@ -88,7 +96,7 @@ impl std::fmt::Display for ClientIdentity {
 
 struct PortBinding {
   client_identity: ClientIdentity,
-  name: String,
+  service_name: String,
   runtime_handle: RuntimeHandle,
 }
 
@@ -139,10 +147,10 @@ fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>
   let mut transport = compio_quic::TransportConfig::default();
 
   // Keep-alive to detect dead connections
-  transport.keep_alive_interval(Some(Duration::from_secs(30)));
+  transport.keep_alive_interval(Some(Duration::from_secs(5)));
 
   // Longer idle timeout for server (handles multiple clients)
-  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(60))?));
+  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10))?));
 
   // High stream limit for busy proxies
   transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
@@ -188,6 +196,7 @@ fn create_udp_socket(bind_addr: SocketAddr) -> anyhow::Result<std::net::UdpSocke
       debug!("UDP_GRO enabled successfully");
     }
   }
+
   socket.bind(&bind_addr.into())?;
   Ok(socket.into())
 }
@@ -219,29 +228,24 @@ async fn accept_connections(endpoint: Endpoint) -> anyhow::Result<()> {
     let remote_addr = incoming.remote_address();
     debug!("Incoming connection from {}", remote_addr);
 
-    let registry = registry.clone();
-
-    // Spawn handler for each connection
-    compio::runtime::spawn(async move {
-      match incoming.await {
-        Ok(conn) => {
-          let identity = ClientIdentity::from_socket_addr(remote_addr);
+    match incoming.await {
+      Ok(conn) => {
+        let registry = registry.clone();
+        compio::runtime::spawn(async move {
+          let identity = ClientIdentity::from(remote_addr);
           info!("Connection established: {}", identity);
-
           if let Err(e) = handle_quic_connection(conn, &identity, &registry).await {
             warn!("Connection handler error for {}: {}", identity, e);
           }
-
-          // Cleanup all listeners for this specific connection
           cleanup_listeners(&registry, &identity).await;
           info!("Connection closed: {}", identity);
-        }
-        Err(e) => {
-          warn!("Handshake failed for {}: {}", remote_addr, e);
-        }
+        })
+        .detach();
       }
-    })
-    .detach();
+      Err(e) => {
+        warn!("Handshake failed for {}: {}", remote_addr, e);
+      }
+    }
   }
 
   Ok(())
@@ -258,17 +262,29 @@ async fn handle_quic_connection(
   loop {
     match read_frame::<ClientControlMessage>(&mut control_recv).await {
       Ok(ClientControlMessage::RegisterService(def)) => {
-        if let Err(e) = handle_register_service(
-          def,
-          &mut control_send,
-          &conn,
-          client_identity,
-          registry,
-        )
-        .await
-        {
-          warn!("handle_register_service error: {:?}", e);
-        }
+        let service_name = def.name.clone();
+        let service_port = def.remote_port;
+        let tcp_listener = match register_service(&def, client_identity, registry).await {
+          RegisterServiceResult::Registered(tcp_listener) => tcp_listener,
+          RegisterServiceResult::OSError(msg)
+          | RegisterServiceResult::AllReadyRegistred(msg)
+          | RegisterServiceResult::UnSolicited(msg) => {
+            let ack = ServerControlMessage::ServiceRegistered {
+              service_name,
+              success: false,
+              error: Some(msg),
+            };
+            write_frame(&mut control_send, &ack).await?;
+            continue;
+          }
+        };
+        let l_conn = conn.clone();
+        let runtime_handle = compio::runtime::spawn(async move {
+          accept_tcp_connections(&l_conn, tcp_listener, &def).await;
+        });
+        let client_identity = client_identity.clone();
+        let port_binding = PortBinding { client_identity, service_name, runtime_handle };
+        registry.insert(service_port, port_binding);
       }
       Ok(ClientControlMessage::UnregisterService(def)) => {
         if let Err(e) =
@@ -288,52 +304,37 @@ async fn handle_quic_connection(
   Ok(())
 }
 
-async fn handle_register_service(
-  def: ServiceDefinition,
-  control_send: &mut compio_quic::SendStream,
-  conn: &Connection,
+async fn register_service(
+  def: &ServiceDefinition,
   client_identity: &ClientIdentity,
   registry: &PortRegistry,
-) -> anyhow::Result<()> {
+) -> RegisterServiceResult {
   debug!("RegisterService: {:?} from {}", def, client_identity);
 
   let need_takeover = {
     if let Some(existing) = registry.get(&def.remote_port) {
       if client_identity.is_same_connection(&existing.client_identity) {
         // Same connection re-registering - already registered
-        info!(
+        let msg = format!(
           "Port {} already registered by this connection {}",
           def.remote_port, client_identity
         );
-        let ack = ServerControlMessage::ServiceRegistered {
-          service_name: def.name,
-          success: true,
-          error: Some("Already registered".to_string()),
-        };
-        write_frame(control_send, &ack).await?;
-        return Ok(());
+        info!(msg);
+
+        return RegisterServiceResult::AllReadyRegistred(msg);
       } else if client_identity.is_same_client(&existing.client_identity) {
         // Same client, different connection (reconnect) - take over
         true
       } else {
         // Different client - reject
-        error!(
+        let msg = format!(
           "Port {} conflict: requested by {} but owned by {} (service: {})",
           def.remote_port,
           client_identity,
           existing.client_identity,
-          existing.name
+          existing.service_name
         );
-        let ack = ServerControlMessage::ServiceRegistered {
-          service_name: def.name,
-          success: false,
-          error: Some(format!(
-            "Port {} is already in use by another client",
-            def.remote_port
-          )),
-        };
-        write_frame(control_send, &ack).await?;
-        return Ok(());
+        return RegisterServiceResult::UnSolicited(msg);
       }
     } else {
       false
@@ -348,26 +349,21 @@ async fn handle_register_service(
     if let Some((_, old_binding)) = registry.remove(&def.remote_port) {
       debug!(
         "Cancelling listener for port {} (client={}, service={})",
-        def.remote_port, old_binding.client_identity, old_binding.name
+        def.remote_port, old_binding.client_identity, old_binding.service_name
       );
       old_binding.runtime_handle.cancel().await;
     }
   }
 
-  let listener = match create_tcp_listener_with_retry(&def, 3).await {
+  let listener = match create_tcp_listener_with_retry(def, 3).await {
     Ok(l) => l,
     Err(e) => {
-      warn!(
+      let msg = format!(
         "Failed to create listener for port {} ({}): {}",
         def.remote_port, client_identity, e
       );
-      let ack = ServerControlMessage::ServiceRegistered {
-        service_name: def.name,
-        success: false,
-        error: Some(format!("{}", e)),
-      };
-      write_frame(control_send, &ack).await?;
-      return Ok(());
+      warn!(msg);
+      return RegisterServiceResult::OSError(msg);
     }
   };
 
@@ -376,43 +372,62 @@ async fn handle_register_service(
     def.name, def.remote_port, client_identity
   );
 
-  let l_client_identity = client_identity.clone();
-  let l_registry = registry.clone();
-  let l_port = def.remote_port;
-  let l_conn = conn.clone();
-  let l_def = def.clone();
+  RegisterServiceResult::Registered(listener)
+}
 
-  let accept_task = compio::runtime::spawn(async move {
-    accept_tcp_connections(&l_conn, listener, &l_def).await;
-    // Remove from registry if still owned by this connection
-    if let Some(entry) = l_registry.get(&l_port)
-      && l_client_identity.is_same_connection(&entry.client_identity)
-    {
-      drop(entry);
-      l_registry.remove(&l_port);
+async fn create_tcp_listener_with_retry(
+  service: &ServiceDefinition,
+  max_retries: u32,
+) -> anyhow::Result<TcpListener> {
+  let bind_addr = match BIND_ADDR_TYPE.get_or_init(|| BindAddrType::Ipv4) {
+    BindAddrType::Ipv4 => format!("0.0.0.0:{}", service.remote_port),
+    BindAddrType::DualStack | BindAddrType::Ipv6 => {
+      format!("[::]:{}", service.remote_port)
     }
-  });
-
-  debug!("Adding to registry for {}", def.name);
-  // Track in global registry
-  registry.insert(
-    def.remote_port,
-    PortBinding {
-      client_identity: client_identity.clone(),
-      name: def.name.clone(),
-      runtime_handle: accept_task,
-    },
-  );
-  debug!("Sending registration ACK to client {}", def.name);
-  let ack = ServerControlMessage::ServiceRegistered {
-    service_name: def.name,
-    success: true,
-    error: None,
   };
-  write_frame(control_send, &ack).await?;
-  debug!("Sent registration ACK to client");
+  let opts = TcpOpts::new()
+    .nodelay(true)
+    .keepalive(true)
+    .reuse_port(true)
+    .write_timeout(Duration::from_secs(2))
+    .read_timeout(Duration::from_secs(2));
 
-  Ok(())
+  let mut last_error = None;
+
+  for attempt in 0..=max_retries {
+    match TcpListener::bind_with_options(&bind_addr, opts).await {
+      Ok(listener) => {
+        if attempt > 0 {
+          debug!(
+            "Successfully bound TCP listener on {} after {} retries",
+            bind_addr, attempt
+          );
+        } else {
+          debug!("Bound TCP listener: {}", bind_addr);
+        }
+        return Ok(listener);
+      }
+      Err(e) => {
+        last_error = Some(e);
+        if attempt < max_retries {
+          debug!(
+            "Failed to bind {} (attempt {}), retrying in 100ms: {}",
+            bind_addr,
+            attempt + 1,
+            last_error.as_ref().unwrap()
+          );
+          compio::time::sleep(Duration::from_millis(100)).await;
+        }
+      }
+    }
+  }
+
+  Err(anyhow::anyhow!(
+    "Failed to bind {} after {} attempts: {}",
+    bind_addr,
+    max_retries + 1,
+    last_error.unwrap()
+  ))
 }
 
 async fn handle_unregister_service(
@@ -422,29 +437,10 @@ async fn handle_unregister_service(
   registry: &PortRegistry,
 ) -> anyhow::Result<()> {
   debug!("UnregisterService: {:?} from {}", def, client_identity);
+  let mut cleaned: u32 = 0;
+  remove_port(&def.remote_port, &mut cleaned, registry, client_identity).await;
 
-  let mut success = false;
-
-  if let Some(entry) = registry.get(&def.remote_port) {
-    if client_identity.is_same_connection(&entry.client_identity) {
-      drop(entry);
-      if let Some((_, binding)) = registry.remove(&def.remote_port) {
-        binding.runtime_handle.cancel().await;
-        info!(
-          "Unregistered service '{}' on port {} for {}",
-          def.name, def.remote_port, client_identity
-        );
-        success = true;
-      }
-    } else {
-      debug!(
-        "Port {} not owned by this connection {}, ignoring unregister",
-        def.remote_port, client_identity
-      );
-    }
-  } else {
-    debug!("No active listener found for port {} ({})", def.remote_port, client_identity);
-  }
+  let success = cleaned != 0;
 
   let ack = ServerControlMessage::ServiceUnregistered {
     service_name: def.name,
@@ -466,10 +462,7 @@ async fn accept_tcp_connections(
   service: &ServiceDefinition,
 ) {
   let port = service.remote_port;
-  info!(
-    "Accepting TCP connections on port {} for service '{}'",
-    port, service.name
-  );
+  info!("Accepting TCP connections on port {} for service '{}'", port, service.name);
 
   loop {
     match listener.accept().await {
@@ -556,85 +549,36 @@ async fn proxy_tcp_to_quic(
   Ok(())
 }
 
-async fn create_tcp_listener_with_retry(
-  service: &ServiceDefinition,
-  max_retries: u32,
-) -> anyhow::Result<TcpListener> {
-  let bind_addr = match BIND_ADDR_TYPE.get_or_init(|| BindAddrType::Ipv4) {
-    BindAddrType::Ipv4 => format!("0.0.0.0:{}", service.remote_port),
-    BindAddrType::DualStack | BindAddrType::Ipv6 => {
-      format!("[::]:{}", service.remote_port)
-    }
-  };
-  let opts = TcpOpts::new()
-    .nodelay(true)
-    .keepalive(true)
-    .reuse_port(true)
-    .write_timeout(Duration::from_secs(2))
-    .read_timeout(Duration::from_secs(2));
-
-  let mut last_error = None;
-
-  for attempt in 0..=max_retries {
-    match TcpListener::bind_with_options(&bind_addr, opts).await {
-      Ok(listener) => {
-        if attempt > 0 {
-          debug!(
-            "Successfully bound TCP listener on {} after {} retries",
-            bind_addr, attempt
-          );
-        } else {
-          debug!("Bound TCP listener: {}", bind_addr);
-        }
-        return Ok(listener);
+async fn remove_port(
+  port: &u16,
+  cleaned: &mut u32,
+  registry: &PortRegistry,
+  client: &ClientIdentity,
+) {
+  // Double-check this connection still owns it (not taken over)
+  if let Some(entry) = registry.get(port) {
+    if client.is_same_connection(&entry.client_identity) {
+      drop(entry);
+      if let Some((_, binding)) = registry.remove(port) {
+        binding.runtime_handle.cancel().await;
+        debug!("Cleaned up port {} (service: {})", port, binding.service_name);
+        *cleaned += 1;
       }
-      Err(e) => {
-        last_error = Some(e);
-        if attempt < max_retries {
-          debug!(
-            "Failed to bind {} (attempt {}), retrying in 100ms: {}",
-            bind_addr,
-            attempt + 1,
-            last_error.as_ref().unwrap()
-          );
-          compio::time::sleep(Duration::from_millis(100)).await;
-        }
-      }
+    } else {
+      debug!(
+        "Port {} was taken over by {}, skipping cleanup",
+        port, entry.client_identity
+      );
     }
   }
-
-  Err(anyhow::anyhow!(
-    "Failed to bind {} after {} attempts: {}",
-    bind_addr,
-    max_retries + 1,
-    last_error.unwrap()
-  ))
 }
 
-/// Cleanup all listeners owned by this specific connection
 async fn cleanup_listeners(registry: &PortRegistry, client: &ClientIdentity) {
   let ports = client.get_ports(registry);
   let mut cleaned = 0;
-
   for port in ports {
-    // Double-check this connection still owns it (not taken over)
-    if let Some(entry) = registry.get(&port) {
-      if client.is_same_connection(&entry.client_identity) {
-        drop(entry);
-        if let Some((_, binding)) = registry.remove(&port) {
-          binding.runtime_handle.cancel().await;
-          debug!("Cleaned up port {} (service: {})", port, binding.name);
-          cleaned += 1;
-        }
-      } else {
-        debug!(
-          "Port {} was taken over by {}, skipping cleanup",
-          port, entry.client_identity
-        );
-      }
-    }
+    remove_port(&port, &mut cleaned, registry, client).await;
   }
-
   if cleaned > 0 {
     info!("Cleaned up {} ports for {}", cleaned, client);
   }

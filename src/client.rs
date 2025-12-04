@@ -128,8 +128,8 @@ fn resolve_server_addr(
 fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>> {
   let mut config = compio_quic::TransportConfig::default();
 
-  config.keep_alive_interval(Some(Duration::from_secs(30)));
-  config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(60))?));
+  config.keep_alive_interval(Some(Duration::from_secs(5)));
+  config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10))?));
   config.max_concurrent_bidi_streams(VarInt::from_u64(10)?);
 
   Ok(Arc::new(config))

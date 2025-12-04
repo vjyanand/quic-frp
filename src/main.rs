@@ -14,10 +14,10 @@ mod tls;
 
 #[compio::main]
 async fn main() -> anyhow::Result<()> {
-  let subscriber = FmtSubscriber::builder().with_max_level(Level::WARN).finish();
+  let subscriber = FmtSubscriber::builder().with_max_level(Level::TRACE).finish();
   tracing::subscriber::set_global_default(subscriber)
     .expect("setting default subscriber failed");
-  
+
   let cli = Cli::try_parse()?;
   debug!("Using config file {}", cli.config);
   let config = Config::load(&cli.config)?;
