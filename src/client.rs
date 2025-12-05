@@ -45,9 +45,9 @@ pub async fn run_client(config: ClientConfig, config_path: &str) -> anyhow::Resu
     services.insert(svc.remote_port, svc);
   }
 
-  let alpn: Arc<str> = match config.token {
-    Some(token) => format!("quic-proxy-{}-{}", VERSION_MAJOR, token).into(),
-    None => format!("quic-proxy-{}", VERSION_MAJOR).into(),
+  let alpn = match config.token {
+    Some(token) => format!("quic-proxy-{}-{}", VERSION_MAJOR, token),
+    None => format!("quic-proxy-{}", VERSION_MAJOR),
   };
 
   loop {
@@ -80,7 +80,6 @@ pub async fn run_client(config: ClientConfig, config_path: &str) -> anyhow::Resu
   Ok(())
 }
 
-#[derive(Clone, Copy)]
 enum LoopControl {
   Shutdown,
   Reconnect,
@@ -141,9 +140,8 @@ async fn connect_to_server(
   alpn: &str,
   transport_config: &Arc<compio_quic::TransportConfig>,
 ) -> anyhow::Result<Connection> {
-  let mut client_config = ClientBuilder::new_with_no_server_verification()
-    .with_alpn_protocols(&[alpn])
-    .build();
+  let mut client_config =
+    ClientBuilder::new_with_no_server_verification().with_alpn_protocols(&[alpn]).build();
 
   client_config.transport_config(Arc::clone(transport_config));
 
@@ -257,10 +255,10 @@ fn setup_config_watcher(
 
   let mut watcher = RecommendedWatcher::new(
     move |res: Result<Event, _>| {
-      if let Ok(event) = res {
-        if event.kind.is_modify() {
-          let _ = tx.send(());
-        }
+      if let Ok(event) = res
+        && event.kind.is_modify()
+      {
+        let _ = tx.send(());
       }
     },
     config,
@@ -299,8 +297,7 @@ async fn handle_config_reload(
   for svc in new_config.services {
     if !current_ports.contains(&svc.remote_port) {
       info!("Registering new service: {}", svc.name);
-      write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone()))
-        .await?;
+      write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone())).await?;
       services.insert(svc.remote_port, svc);
     } else if let Some(mut entry) = services.get_mut(&svc.remote_port) {
       // Update existing service if local_addr changed
