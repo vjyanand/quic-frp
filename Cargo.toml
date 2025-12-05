@@ -29,9 +29,10 @@ serde = {version = "1.0.228", features=["serde_derive"]}
 socket2 = "0.6.1"
 toml = "0.9.8"
 tracing = "0.1.43"
-tracing-subscriber = "0.3.22"
+tracing-subscriber = {version = "0.3.22" , default-features = false, features = ["fmt", "env-filter"]}
 uuid = {version = "1.19.0", features=["v4"]}
 
 [profile.release]
 opt-level = "z"
-strip = true
+#strip = true
+debug = true
