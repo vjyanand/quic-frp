@@ -8,7 +8,7 @@ use compio_quic::{
 use dashmap::DashMap;
 use futures::future::{Either, select};
 use socket2::{Domain, Protocol, Socket, Type};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
   config::{ServerConfig, ServiceDefinition, VERSION_MAJOR},
@@ -23,24 +23,35 @@ static BIND_ADDR_TYPE: std::sync::OnceLock<BindAddrType> = std::sync::OnceLock::
 
 enum RegisterServiceResult {
   Registered(TcpListener),
-  AllReadyRegistred(String),
-  UnSolicited(String),
-  OSError(String),
+  AlreadyRegistered(String),
+  Unsolicited(String),
+  OsError(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum BindAddrType {
-  Ipv4,      // 0.0.0.0
-  Ipv6,      // [::]
-  DualStack, // [::] with dual-stack enabled
+  Ipv4,
+  Ipv6,
+  DualStack,
 }
 
 impl BindAddrType {
+  #[inline]
   fn detect(addr: &SocketAddr) -> Self {
     match addr {
       SocketAddr::V4(_) => Self::Ipv4,
       SocketAddr::V6(v6) if v6.ip().is_unspecified() => Self::DualStack,
       SocketAddr::V6(_) => Self::Ipv6,
+    }
+  }
+
+  #[inline]
+  fn bind_addr(self, port: u16) -> SocketAddr {
+    match self {
+      Self::Ipv4 => SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port),
+      Self::DualStack | Self::Ipv6 => {
+        SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port)
+      }
     }
   }
 }
@@ -52,15 +63,13 @@ struct ClientIdentity {
 }
 
 impl From<SocketAddr> for ClientIdentity {
+  #[inline]
   fn from(addr: SocketAddr) -> Self {
     let remote_ip = match addr.ip() {
-      std::net::IpAddr::V6(v6) => {
-        if let Some(v4) = v6.to_ipv4_mapped() {
-          std::net::IpAddr::V4(v4)
-        } else {
-          std::net::IpAddr::V6(v6)
-        }
-      }
+      std::net::IpAddr::V6(v6) => v6
+        .to_ipv4_mapped()
+        .map(std::net::IpAddr::V4)
+        .unwrap_or_else(|| std::net::IpAddr::V6(v6)),
       ip => ip,
     };
     Self { remote_ip, identifier: uuid::Uuid::new_v4() }
@@ -68,13 +77,13 @@ impl From<SocketAddr> for ClientIdentity {
 }
 
 impl ClientIdentity {
-  /// Check if this is the same logical client (same IP, possibly different connection)
-  fn is_same_client(&self, other: &ClientIdentity) -> bool {
+  #[inline]
+  fn is_same_client(&self, other: &Self) -> bool {
     self.remote_ip == other.remote_ip
   }
 
-  /// Check if this is the exact same connection (same IP and UUID)
-  fn is_same_connection(&self, other: &ClientIdentity) -> bool {
+  #[inline]
+  fn is_same_connection(&self, other: &Self) -> bool {
     self.remote_ip == other.remote_ip && self.identifier == other.identifier
   }
 
@@ -90,33 +99,32 @@ impl ClientIdentity {
 
 impl std::fmt::Display for ClientIdentity {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(f, "{}({})", self.remote_ip, &self.identifier.to_string()[..8])
+    // Pre-format UUID slice to avoid allocation in hot path
+    let uuid_str = self.identifier.as_hyphenated();
+    write!(f, "{}({:.8})", self.remote_ip, uuid_str)
   }
 }
 
 struct PortBinding {
   client_identity: ClientIdentity,
-  service_name: String,
+  service_name: Box<str>, // Use Box<str> instead of String for immutable data
   runtime_handle: RuntimeHandle,
 }
 
-/// Server entry point: bind UDP socket, accept QUIC connections, handle control protocol.
+/// Server entry point
 pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
   info!("Server starting on {}", config.listen_addr);
 
-  let (cert_der, key_der) = if config.cert.is_some() && config.key.is_some() {
-    TlsCertConfig::from_pem_files(config.cert.unwrap(), config.key.unwrap()).load()?
-  } else {
-    TlsCertConfig::self_signed(vec!["localhost".to_owned()]).load()?
+  let (cert_der, key_der) = match (config.cert, config.key) {
+    (Some(cert), Some(key)) => TlsCertConfig::from_pem_files(cert, key).load()?,
+    _ => TlsCertConfig::self_signed(vec!["localhost"]).load()?,
   };
 
-  let alpn = if let Some(token) = config.token {
-    format!("quic-proxy-{}-{}", VERSION_MAJOR, token)
-  } else {
-    format!("quic-proxy-{}", VERSION_MAJOR)
+  let alpn = match config.token {
+    Some(token) => format!("quic-proxy-{}-{}", VERSION_MAJOR, token),
+    None => format!("quic-proxy-{}", VERSION_MAJOR),
   };
 
-  // Configure QUIC server
   let mut server_config = ServerBuilder::new_with_single_cert(cert_der, key_der)
     .map_err(|e| anyhow::anyhow!("Failed to create server config: {}", e))?
     .with_alpn_protocols(&[&alpn])
@@ -124,7 +132,6 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
 
   server_config.transport_config(create_transport_config()?);
 
-  // Bind UDP socket with socket2 for advanced options
   let bind_addr: SocketAddr = config.listen_addr.parse()?;
   let _ = BIND_ADDR_TYPE.set(BindAddrType::detect(&bind_addr));
   let socket = create_udp_socket(bind_addr)?;
@@ -136,102 +143,123 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     BIND_ADDR_TYPE.get().unwrap()
   );
 
-  // Accept QUIC connections indefinitely
-  accept_connections(endpoint).await?;
-
-  Ok(())
+  accept_connections(endpoint).await
 }
 
-/// Create QUIC transport configuration optimized for proxy workload.
 fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>> {
   let mut transport = compio_quic::TransportConfig::default();
-
-  // Keep-alive to detect dead connections
   transport.keep_alive_interval(Some(Duration::from_secs(5)));
-
-  // Longer idle timeout for server (handles multiple clients)
   transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10))?));
-
-  // High stream limit for busy proxies
   transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
+
+  // Additional optimizations
+  transport.send_window(8 * 1024 * 1024); // 8MB send window
+  transport.stream_receive_window(VarInt::from_u64(2 * 1024 * 1024)?); // 2MB per stream
+  transport.receive_window(VarInt::from_u64(16 * 1024 * 1024)?); // 16MB total receive
 
   Ok(Arc::new(transport))
 }
 
-/// Create and configure UDP socket with optimal settings for QUIC.
 fn create_udp_socket(bind_addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
   let socket =
     Socket::new(Domain::for_address(bind_addr), Type::DGRAM, Some(Protocol::UDP))?;
 
   socket.set_nonblocking(true)?;
-  socket.set_keepalive(true)?;
+  // Note: UDP sockets don't support keepalive - removed invalid call
 
-  // Increase buffer sizes significantly (2MB each)
-  socket.set_recv_buffer_size(2 * 1024 * 1024)?;
-  socket.set_send_buffer_size(2 * 1024 * 1024)?;
+  // Increase buffer sizes (4MB each for high throughput)
+  const BUFFER_SIZE: usize = 4 * 1024 * 1024;
+  socket.set_recv_buffer_size(BUFFER_SIZE)?;
+  socket.set_send_buffer_size(BUFFER_SIZE)?;
 
   #[cfg(target_os = "linux")]
-  {
-    // Enable UDP GRO for receive offload (Linux-specific)
-    use std::os::fd::AsRawFd;
-    const UDP_GRO: libc::c_int = 104;
-    let enable: libc::c_int = 1;
-
-    let result = unsafe {
-      libc::setsockopt(
-        socket.as_raw_fd(),
-        libc::SOL_UDP,
-        UDP_GRO,
-        &enable as *const _ as *const libc::c_void,
-        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-      )
-    };
-
-    if result != 0 {
-      warn!(
-        "Failed to enable UDP_GRO (may not be supported): {}",
-        std::io::Error::last_os_error()
-      );
-    } else {
-      debug!("UDP_GRO enabled successfully");
-    }
-  }
+  configure_linux_socket(&socket);
 
   socket.bind(&bind_addr.into())?;
   Ok(socket.into())
 }
 
-/// Create QUIC endpoint from UDP socket.
+#[cfg(target_os = "linux")]
+fn configure_linux_socket(socket: &Socket) {
+  use std::os::fd::AsRawFd;
+
+  const UDP_GRO: libc::c_int = 104;
+  const UDP_SEGMENT: libc::c_int = 103; // GSO for send offload
+
+  let fd = socket.as_raw_fd();
+  let enable: libc::c_int = 1;
+
+  // Enable UDP GRO (receive offload)
+  let result = unsafe {
+    libc::setsockopt(
+      fd,
+      libc::SOL_UDP,
+      UDP_GRO,
+      &enable as *const _ as *const libc::c_void,
+      std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+    )
+  };
+  if result == 0 {
+    debug!("UDP_GRO enabled");
+  } else {
+    debug!("UDP_GRO not available: {}", std::io::Error::last_os_error());
+  }
+
+  // Enable UDP GSO (send offload) with segment size
+  let segment_size: u16 = 1472; // Typical MTU - IP/UDP headers
+  let result = unsafe {
+    libc::setsockopt(
+      fd,
+      libc::SOL_UDP,
+      UDP_SEGMENT,
+      &segment_size as *const _ as *const libc::c_void,
+      std::mem::size_of::<u16>() as libc::socklen_t,
+    )
+  };
+  if result == 0 {
+    debug!("UDP_GSO enabled with segment size {}", segment_size);
+  } else {
+    debug!("UDP_GSO not available: {}", std::io::Error::last_os_error());
+  }
+
+  // Set IP_TOS for lower latency (DSCP EF)
+  let tos: libc::c_int = 0xB8; // DSCP EF (Expedited Forwarding)
+  let _ = unsafe {
+    libc::setsockopt(
+      fd,
+      libc::IPPROTO_IP,
+      libc::IP_TOS,
+      &tos as *const _ as *const libc::c_void,
+      std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+    )
+  };
+}
+
 fn create_endpoint(
   udp_socket: std::net::UdpSocket,
   server_config: compio_quic::ServerConfig,
 ) -> anyhow::Result<Endpoint> {
   let socket = compio_net::UdpSocket::from_std(udp_socket)?;
-  let endpoint =
-    Endpoint::new(socket, EndpointConfig::default(), Some(server_config), None)?;
-  Ok(endpoint)
+  Endpoint::new(socket, EndpointConfig::default(), Some(server_config), None)
+    .map_err(Into::into)
 }
 
-/// Accept incoming QUIC connections and spawn handlers.
 async fn accept_connections(endpoint: Endpoint) -> anyhow::Result<()> {
-  let registry: PortRegistry = Arc::new(DashMap::new());
+  let registry: PortRegistry = Arc::new(DashMap::with_capacity(64));
 
   loop {
-    let incoming = match endpoint.wait_incoming().await {
-      Some(inc) => inc,
-      None => {
-        warn!("Endpoint closed, shutting down");
-        break;
-      }
+    let Some(incoming) = endpoint.wait_incoming().await else {
+      warn!("Endpoint closed, shutting down");
+      break;
     };
 
     let remote_addr = incoming.remote_address();
     debug!("Incoming connection from {}", remote_addr);
 
-    match incoming.await {
-      Ok(conn) => {
-        let registry = registry.clone();
-        compio::runtime::spawn(async move {
+    let registry = Arc::clone(&registry);
+    compio::runtime::spawn(async move {
+      match incoming.await {
+        Ok(conn) => {
           let identity = ClientIdentity::from(remote_addr);
           info!("Connection established: {}", identity);
           if let Err(e) = handle_quic_connection(conn, &identity, &registry).await {
@@ -239,13 +267,13 @@ async fn accept_connections(endpoint: Endpoint) -> anyhow::Result<()> {
           }
           cleanup_listeners(&registry, &identity).await;
           info!("Connection closed: {}", identity);
-        })
-        .detach();
+        }
+        Err(e) => {
+          warn!("Handshake failed for {}: {}", remote_addr, e);
+        }
       }
-      Err(e) => {
-        warn!("Handshake failed for {}: {}", remote_addr, e);
-      }
-    }
+    })
+    .detach();
   }
 
   Ok(())
@@ -262,29 +290,8 @@ async fn handle_quic_connection(
   loop {
     match read_frame::<ClientControlMessage>(&mut control_recv).await {
       Ok(ClientControlMessage::RegisterService(def)) => {
-        let service_name = def.name.clone();
-        let service_port = def.remote_port;
-        let tcp_listener = match register_service(&def, client_identity, registry).await {
-          RegisterServiceResult::Registered(tcp_listener) => tcp_listener,
-          RegisterServiceResult::OSError(msg)
-          | RegisterServiceResult::AllReadyRegistred(msg)
-          | RegisterServiceResult::UnSolicited(msg) => {
-            let ack = ServerControlMessage::ServiceRegistered {
-              service_name,
-              success: false,
-              error: Some(msg),
-            };
-            write_frame(&mut control_send, &ack).await?;
-            continue;
-          }
-        };
-        let l_conn = conn.clone();
-        let runtime_handle = compio::runtime::spawn(async move {
-          accept_tcp_connections(&l_conn, tcp_listener, &def).await;
-        });
-        let client_identity = client_identity.clone();
-        let port_binding = PortBinding { client_identity, service_name, runtime_handle };
-        registry.insert(service_port, port_binding);
+        handle_register_service(def, &conn, &mut control_send, client_identity, registry)
+          .await?;
       }
       Ok(ClientControlMessage::UnregisterService(def)) => {
         if let Err(e) =
@@ -304,6 +311,55 @@ async fn handle_quic_connection(
   Ok(())
 }
 
+async fn handle_register_service(
+  def: ServiceDefinition,
+  conn: &Connection,
+  control_send: &mut compio_quic::SendStream,
+  client_identity: &ClientIdentity,
+  registry: &PortRegistry,
+) -> anyhow::Result<()> {
+  let service_name = def.name.clone();
+  let service_port = def.remote_port;
+
+  let tcp_listener = match register_service(&def, client_identity, registry).await {
+    RegisterServiceResult::Registered(tcp_listener) => tcp_listener,
+    RegisterServiceResult::OsError(msg)
+    | RegisterServiceResult::AlreadyRegistered(msg)
+    | RegisterServiceResult::Unsolicited(msg) => {
+      let ack = ServerControlMessage::ServiceRegistered {
+        service_name,
+        success: false,
+        error: Some(msg),
+      };
+      write_frame(control_send, &ack).await?;
+      return Ok(());
+    }
+  };
+
+  // Send success ACK before spawning listener
+  let ack = ServerControlMessage::ServiceRegistered {
+    service_name: service_name.clone(),
+    success: true,
+    error: None,
+  };
+  write_frame(control_send, &ack).await?;
+
+  let conn_clone = conn.clone();
+  let def_clone = def.clone();
+  let runtime_handle = compio::runtime::spawn(async move {
+    accept_tcp_connections(&conn_clone, tcp_listener, &def_clone).await;
+  });
+
+  let port_binding = PortBinding {
+    client_identity: client_identity.clone(),
+    service_name: service_name.into_boxed_str(),
+    runtime_handle,
+  };
+  registry.insert(service_port, port_binding);
+
+  Ok(())
+}
+
 async fn register_service(
   def: &ServiceDefinition,
   client_identity: &ClientIdentity,
@@ -311,80 +367,76 @@ async fn register_service(
 ) -> RegisterServiceResult {
   debug!("RegisterService: {:?} from {}", def, client_identity);
 
-  let need_takeover = {
-    if let Some(existing) = registry.get(&def.remote_port) {
-      if client_identity.is_same_connection(&existing.client_identity) {
-        // Same connection re-registering - already registered
-        let msg = format!(
-          "Port {} already registered by this connection {}",
-          def.remote_port, client_identity
-        );
-        info!(msg);
-
-        return RegisterServiceResult::AllReadyRegistred(msg);
-      } else if client_identity.is_same_client(&existing.client_identity) {
-        // Same client, different connection (reconnect) - take over
-        true
-      } else {
-        // Different client - reject
-        let msg = format!(
-          "Port {} conflict: requested by {} but owned by {} (service: {})",
-          def.remote_port,
-          client_identity,
-          existing.client_identity,
-          existing.service_name
-        );
-        return RegisterServiceResult::UnSolicited(msg);
-      }
+  // Check existing registration - minimize lock duration
+  let takeover_needed = registry.get(&def.remote_port).map(|existing| {
+    if client_identity.is_same_connection(&existing.client_identity) {
+      Err(format!(
+        "Port {} already registered by this connection {}",
+        def.remote_port, client_identity
+      ))
+    } else if client_identity.is_same_client(&existing.client_identity) {
+      Ok(true) // Same client, different connection - takeover
     } else {
-      false
+      Err(format!(
+        "Port {} conflict: requested by {} but owned by {} (service: {})",
+        def.remote_port, client_identity, existing.client_identity, existing.service_name
+      ))
     }
-  };
+  });
 
-  if need_takeover {
-    info!(
-      "Port {} owned by stale connection, taking over for {}",
-      def.remote_port, client_identity
-    );
-    if let Some((_, old_binding)) = registry.remove(&def.remote_port) {
-      debug!(
-        "Cancelling listener for port {} (client={}, service={})",
-        def.remote_port, old_binding.client_identity, old_binding.service_name
-      );
-      old_binding.runtime_handle.cancel().await;
+  match takeover_needed {
+    Some(Err(msg)) if msg.contains("already registered") => {
+      info!("{}", msg);
+      return RegisterServiceResult::AlreadyRegistered(msg);
     }
+    Some(Err(msg)) => {
+      return RegisterServiceResult::Unsolicited(msg);
+    }
+    Some(Ok(true)) => {
+      info!(
+        "Port {} owned by stale connection, taking over for {}",
+        def.remote_port, client_identity
+      );
+      if let Some((_, old_binding)) = registry.remove(&def.remote_port) {
+        debug!(
+          "Cancelling listener for port {} (client={}, service={})",
+          def.remote_port, old_binding.client_identity, old_binding.service_name
+        );
+        old_binding.runtime_handle.cancel().await;
+      }
+    }
+    _ => {}
   }
 
-  let listener = match create_tcp_listener_with_retry(def, 3).await {
-    Ok(l) => l,
+  match create_tcp_listener_with_retry(def, 3).await {
+    Ok(listener) => {
+      info!(
+        "Created listener for service '{}' on port {} for {}",
+        def.name, def.remote_port, client_identity
+      );
+      RegisterServiceResult::Registered(listener)
+    }
     Err(e) => {
       let msg = format!(
         "Failed to create listener for port {} ({}): {}",
         def.remote_port, client_identity, e
       );
-      warn!(msg);
-      return RegisterServiceResult::OSError(msg);
+      warn!("{}", msg);
+      RegisterServiceResult::OsError(msg)
     }
-  };
-
-  info!(
-    "Created listener for service '{}' on port {} for {}",
-    def.name, def.remote_port, client_identity
-  );
-
-  RegisterServiceResult::Registered(listener)
+  }
 }
 
 async fn create_tcp_listener_with_retry(
   service: &ServiceDefinition,
   max_retries: u32,
 ) -> anyhow::Result<TcpListener> {
-  let bind_addr = match BIND_ADDR_TYPE.get_or_init(|| BindAddrType::Ipv4) {
-    BindAddrType::Ipv4 => format!("0.0.0.0:{}", service.remote_port),
-    BindAddrType::DualStack | BindAddrType::Ipv6 => {
-      format!("[::]:{}", service.remote_port)
-    }
-  };
+  let bind_addr = BIND_ADDR_TYPE
+    .get()
+    .copied()
+    .unwrap_or(BindAddrType::Ipv4)
+    .bind_addr(service.remote_port);
+
   let opts = TcpOpts::new()
     .nodelay(true)
     .keepalive(true)
@@ -393,6 +445,7 @@ async fn create_tcp_listener_with_retry(
     .read_timeout(Duration::from_secs(2));
 
   let mut last_error = None;
+  let retry_delay = Duration::from_millis(100);
 
   for attempt in 0..=max_retries {
     match TcpListener::bind_with_options(&bind_addr, opts).await {
@@ -411,12 +464,12 @@ async fn create_tcp_listener_with_retry(
         last_error = Some(e);
         if attempt < max_retries {
           debug!(
-            "Failed to bind {} (attempt {}), retrying in 100ms: {}",
+            "Failed to bind {} (attempt {}), retrying: {}",
             bind_addr,
             attempt + 1,
             last_error.as_ref().unwrap()
           );
-          compio::time::sleep(Duration::from_millis(100)).await;
+          compio::time::sleep(retry_delay).await;
         }
       }
     }
@@ -437,19 +490,13 @@ async fn handle_unregister_service(
   registry: &PortRegistry,
 ) -> anyhow::Result<()> {
   debug!("UnregisterService: {:?} from {}", def, client_identity);
-  let mut cleaned: u32 = 0;
-  remove_port(&def.remote_port, &mut cleaned, registry, client_identity).await;
 
-  let success = cleaned != 0;
+  let success = remove_port(def.remote_port, registry, client_identity).await;
 
   let ack = ServerControlMessage::ServiceUnregistered {
     service_name: def.name,
     success,
-    error: if success {
-      None
-    } else {
-      Some("Port not owned by this connection".to_string())
-    },
+    error: (!success).then(|| "Port not owned by this connection".to_string()),
   };
   write_frame(control_send, &ack).await?;
 
@@ -470,7 +517,6 @@ async fn accept_tcp_connections(
         debug!("Accepted TCP connection on port {} from {}", port, peer_addr);
 
         let conn_clone = conn.clone();
-
         compio::runtime::spawn(async move {
           if let Err(e) =
             handle_tcp_connection(conn_clone, tcp_stream, port, peer_addr).await
@@ -501,9 +547,9 @@ async fn handle_tcp_connection(
 
   debug!("Opened QUIC stream for TCP peer {}", peer_addr);
 
-  let port_header = port.to_be_bytes();
+  // Write port header - use array directly without intermediate variable
   quic_send
-    .write_all(&port_header)
+    .write_all(&port.to_be_bytes())
     .await
     .map_err(|e| anyhow::anyhow!("Failed to write port header: {}", e))?;
 
@@ -521,64 +567,63 @@ async fn proxy_tcp_to_quic(
 
   let upstream = async {
     let result = copy(&mut tcp_r, quic_send).await;
-    match quic_send.finish() {
-      Ok(()) => trace!("called QUIC send finish"),
-      Err(err) => trace!("error calling QUIC send finish {}", err),
-    }
+    let _ = quic_send.finish(); // Ignore finish errors in fast path
     result
   };
 
-  let downstream = async { copy(quic_recv, &mut tcp_w).await };
+  let downstream = copy(quic_recv, &mut tcp_w);
 
   let upstream = std::pin::pin!(upstream);
   let downstream = std::pin::pin!(downstream);
 
+  // Use select for first-completion semantics
   match select(upstream, downstream).await {
-    Either::Left((res, _)) => {
-      if let Err(e) = res {
-        debug!("Upstream (TCP->QUIC) error: {}", e);
-      }
-    }
-    Either::Right((res, _)) => {
-      if let Err(e) = res {
-        debug!("Downstream (QUIC->TCP) error: {}", e);
-      }
-    }
+    Either::Left((Err(e), _)) => debug!("Upstream (TCP->QUIC) error: {}", e),
+    Either::Right((Err(e), _)) => debug!("Downstream (QUIC->TCP) error: {}", e),
+    _ => {}
   }
 
   Ok(())
 }
 
+/// Remove a port binding if owned by the given client. Returns true if removed.
 async fn remove_port(
-  port: &u16,
-  cleaned: &mut u32,
+  port: u16,
   registry: &PortRegistry,
   client: &ClientIdentity,
-) {
-  // Double-check this connection still owns it (not taken over)
-  if let Some(entry) = registry.get(port) {
-    if client.is_same_connection(&entry.client_identity) {
-      drop(entry);
-      if let Some((_, binding)) = registry.remove(port) {
-        binding.runtime_handle.cancel().await;
-        debug!("Cleaned up port {} (service: {})", port, binding.service_name);
-        *cleaned += 1;
-      }
-    } else {
-      debug!(
-        "Port {} was taken over by {}, skipping cleanup",
-        port, entry.client_identity
-      );
+) -> bool {
+  // Check ownership first with minimal lock time
+  let owns_port = registry
+    .get(&port)
+    .map(|entry| client.is_same_connection(&entry.client_identity))
+    .unwrap_or(false);
+
+  if owns_port {
+    if let Some((_, binding)) = registry.remove(&port) {
+      binding.runtime_handle.cancel().await;
+      debug!("Cleaned up port {} (service: {})", port, binding.service_name);
+      return true;
     }
+  } else if registry.contains_key(&port) {
+    debug!("Port {} was taken over, skipping cleanup", port);
   }
+
+  false
 }
 
 async fn cleanup_listeners(registry: &PortRegistry, client: &ClientIdentity) {
   let ports = client.get_ports(registry);
-  let mut cleaned = 0;
-  for port in ports {
-    remove_port(&port, &mut cleaned, registry, client).await;
+  if ports.is_empty() {
+    return;
   }
+
+  let mut cleaned = 0u32;
+  for port in ports {
+    if remove_port(port, registry, client).await {
+      cleaned += 1;
+    }
+  }
+
   if cleaned > 0 {
     info!("Cleaned up {} ports for {}", cleaned, client);
   }
