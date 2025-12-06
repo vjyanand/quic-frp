@@ -21,6 +21,7 @@ pub struct ClientConfig {
   pub retry_interval: Option<u64>,
   pub services: Vec<ServiceDefinition>,
   pub token: Option<String>,
+  pub cert: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

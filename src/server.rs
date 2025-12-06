@@ -6,8 +6,8 @@ use futures::{
   io::copy,
 };
 use quinn::{
-  Endpoint, EndpointConfig, IdleTimeout, RecvStream, SendStream, ServerConfig,
-  TransportConfig, VarInt, crypto::rustls::QuicServerConfig, default_runtime,
+  Endpoint, EndpointConfig, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
+  crypto::rustls::QuicServerConfig, default_runtime,
 };
 
 use smol::net::TcpListener;
@@ -27,9 +27,8 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
   } else {
     TlsCertConfig::self_signed(vec!["localhost".to_owned()]).load()?
   };
-  let mut server_crypto = rustls::ServerConfig::builder()
-    .with_no_client_auth()
-    .with_single_cert(cert_der, key_der)?;
+
+  let mut server_crypto = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(cert_der, key_der)?;
 
   let alpn = if let Some(token) = config.token {
     format!("quic-proxy-{}-{}", VERSION_MAJOR, token).into_bytes()
@@ -48,10 +47,11 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
   let runtime = default_runtime().unwrap();
   let endpoint = Endpoint::new(endpoinf_config, Some(server_config), socket, runtime)?;
   info!("Server listening on {}", endpoint.local_addr()?);
-  while let Some(conn) = endpoint.accept().await {
-    let fut = handle_connection(conn);
-    smol::spawn(fut).detach();
-  }
+
+  let incoming = endpoint.accept().await.unwrap();
+
+  debug!("New incoming connection");
+  handle_connection(incoming).await?;
   Ok(())
 }
 
@@ -64,15 +64,17 @@ async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
   socket.set_tcp_nodelay(true)?;
   socket.set_nonblocking(true)?;
   socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-  let bind_address = format!("0.0.0.0:{}", "8080");
+  let bind_address = format!("0.0.0.0:{}", "8081");
   let bin = bind_address.parse::<std::net::SocketAddr>()?.into();
   socket.bind(&bin)?;
+  socket.listen(128)?; // <-- THIS WAS MISSING!
 
   let std_listener: std::net::TcpListener = socket.into();
   std_listener.set_nonblocking(true)?;
   let tcp_listener: TcpListener = smol::net::TcpListener::try_from(std_listener)?;
   debug!("TCP Listening on: {:?}", tcp_listener.local_addr());
   loop {
+    debug!("Awaiting on new TCP connection: {:?}", tcp_listener.local_addr());
     let (stream, peer_addr) = tcp_listener.accept().await?;
     debug!("New TCP connection from: {}", peer_addr);
     let l_connection = connection.clone();
@@ -80,13 +82,12 @@ async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
       let _result = handle_client(&l_connection, stream).await;
     })
     .detach();
+    debug!("Ends");
   }
 }
 
-async fn handle_client(
-  connection: &quinn::Connection,
-  stream: smol::net::TcpStream,
-) -> anyhow::Result<()> {
+async fn handle_client(connection: &quinn::Connection, stream: smol::net::TcpStream) -> anyhow::Result<()> {
+  debug!("OPening bi-stream");
   let (mut tx_stream, mut tr_stream) = match connection.open_bi().await {
     Ok(stream) => stream,
     Err(e) => {
@@ -98,11 +99,7 @@ async fn handle_client(
   return Ok(());
 }
 
-async fn proxy_tcp_to_quic(
-  tcp: smol::net::TcpStream,
-  quic_send: &mut SendStream,
-  quic_recv: &mut RecvStream,
-) {
+async fn proxy_tcp_to_quic(tcp: smol::net::TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
   let (mut tcp_r, mut tcp_w) = tcp.split();
 
   let upstream = async {
@@ -132,8 +129,7 @@ async fn proxy_tcp_to_quic(
 
 /// Create and configure UDP socket with optimal settings for QUIC.
 fn create_udp_socket(bind_addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
-  let socket =
-    Socket::new(Domain::for_address(bind_addr), Type::DGRAM, Some(Protocol::UDP))?;
+  let socket = Socket::new(Domain::for_address(bind_addr), Type::DGRAM, Some(Protocol::UDP))?;
 
   socket.set_nonblocking(true)?;
   socket.set_keepalive(true)?;
@@ -145,7 +141,7 @@ fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
   let mut transport = TransportConfig::default();
 
   // Keep-alive to detect dead connections
-  transport.keep_alive_interval(Some(Duration::from_secs(5)));
+  transport.keep_alive_interval(Some(Duration::from_secs(45)));
 
   // Longer idle timeout for server (handles multiple clients)
   transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(60))?));
