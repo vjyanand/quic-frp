@@ -38,10 +38,7 @@ pub async fn read_frame<T: Decode<()>>(stream: &mut RecvStream) -> anyhow::Resul
 }
 
 /// Write a length-prefixed bincode frame to a QUIC send stream
-pub async fn write_frame<T: Encode>(
-  stream: &mut SendStream,
-  frame: &T,
-) -> anyhow::Result<()> {
+pub async fn write_frame<T: Encode>(stream: &mut SendStream, frame: &T) -> anyhow::Result<()> {
   let payload = encode_to_vec(frame, standard())?;
   let len_bytes = (payload.len() as u32).to_be_bytes();
 

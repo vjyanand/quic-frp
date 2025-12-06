@@ -49,8 +49,8 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
   info!("Server listening on {}", endpoint.local_addr()?);
 
   let incoming = endpoint.accept().await.unwrap();
+  debug!("New incoming connection {}", incoming.remote_address());
 
-  debug!("New incoming connection");
   handle_connection(incoming).await?;
   Ok(())
 }
@@ -63,8 +63,9 @@ async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
   let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
   socket.set_tcp_nodelay(true)?;
   socket.set_nonblocking(true)?;
+  socket.set_reuse_address(true)?;
   socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-  let bind_address = format!("0.0.0.0:{}", "8081");
+  let bind_address = format!("0.0.0.0:{}", "7071");
   let bin = bind_address.parse::<std::net::SocketAddr>()?.into();
   socket.bind(&bin)?;
   socket.listen(128)?; // <-- THIS WAS MISSING!
@@ -116,7 +117,7 @@ async fn proxy_tcp_to_quic(tcp: smol::net::TcpStream, quic_send: &mut SendStream
   match select(upstream, downstream).await {
     Either::Left((res, _)) => {
       if let Err(e) = res {
-        debug!("Upstream (TCP->QUIC) error: {}", e);
+        debug!("Upstream (TCP->QUIC)   {}", e);
       }
     }
     Either::Right((res, _)) => {
