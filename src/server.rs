@@ -1,17 +1,15 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use futures::{
-  AsyncReadExt,
-  future::{Either, select},
-  io::copy,
-};
+use futures::
+  future::{Either, select}
+;
 use quinn::{
   Endpoint, EndpointConfig, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
   crypto::rustls::QuicServerConfig, default_runtime,
 };
 
-use smol::net::TcpListener;
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::io::copy;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -50,11 +48,10 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
   loop {
     let incoming = endpoint.accept().await.unwrap();
     debug!("New incoming connection {}", incoming.remote_address());
-    smol::spawn(async move {
+    tokio::spawn(async move {
       let result = handle_connection(incoming).await;
       debug!("result: {:?}", result);
-    })
-    .detach();
+    });
   }
 }
 
@@ -75,23 +72,22 @@ async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
 
   let std_listener: std::net::TcpListener = socket.into();
   std_listener.set_nonblocking(true)?;
-  let tcp_listener: TcpListener = smol::net::TcpListener::try_from(std_listener)?;
+  let tcp_listener = tokio::net::TcpListener::try_from(std_listener)?;
   debug!("TCP Listening on: {:?}", tcp_listener.local_addr());
   loop {
     debug!("Awaiting on new TCP connection: {:?}", tcp_listener.local_addr());
     let (stream, peer_addr) = tcp_listener.accept().await?;
     debug!("New TCP connection from: {}", peer_addr);
     let l_connection = connection.clone();
-    smol::spawn(async move {
+    tokio::spawn(async move {
       let result = handle_client(&l_connection, stream).await;
       debug!("result2: {:?}", result);
-    })
-    .detach();
+    });
     debug!("Ends");
   }
 }
 
-async fn handle_client(connection: &quinn::Connection, stream: smol::net::TcpStream) -> anyhow::Result<()> {
+async fn handle_client(connection: &quinn::Connection, stream: tokio::net::TcpStream) -> anyhow::Result<()> {
   debug!("OPening bi-stream");
   let (mut tx_stream, mut tr_stream) = match connection.open_bi().await {
     Ok(stream) => stream,
@@ -104,7 +100,7 @@ async fn handle_client(connection: &quinn::Connection, stream: smol::net::TcpStr
   Ok(())
 }
 
-async fn proxy_tcp_to_quic(tcp: smol::net::TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
+async fn proxy_tcp_to_quic(mut tcp: tokio::net::TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
   let (mut tcp_r, mut tcp_w) = tcp.split();
 
   let upstream = async {

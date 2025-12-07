@@ -10,14 +10,14 @@ clap = { version = "4.5.53", features = ["derive"] }
 dashmap = "6.1.0"
 futures = "0.3.31"
 notify = "8.2.0"
-quinn = { version = "0.11.9", default-features = false, features = ["bloom","runtime-smol", "futures-io", "rustls-ring", "platform-verifier"]  }
+quinn = { version = "0.11.9"}
 rcgen = "0.14.5"
 rustls = { version = "0.23.35", default-features = false, features = ["ring", "tls12"] }
 rustls-native-certs = "0.8.2"
 rustls-pemfile = "2.2.0"
 serde = {version = "1.0.228", features=["serde_derive"]}
-smol = "2.0.2"
 socket2 = "0.6.1"
+tokio = { version = "1", features = ["full"] }
 toml = "0.9.8"
 tracing = "0.1.43"
 tracing-subscriber = {version = "0.3.22" , default-features = false, features = ["fmt", "env-filter"]}

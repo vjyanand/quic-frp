@@ -12,7 +12,8 @@ mod config;
 mod server;
 mod tls;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
   FmtSubscriber::builder()
     .with_env_filter(
       EnvFilter::try_from_default_env()
@@ -25,10 +26,8 @@ fn main() -> anyhow::Result<()> {
   let cli = Cli::try_parse()?;
   debug!("Using config file {}", cli.config);
   let config = Config::load(&cli.config)?;
-  smol::block_on(async {
-    match config {
-      Config::Server(server_config) => run_server(server_config).await,
-      Config::Client(client_config) => run_client(client_config, &cli.config).await,
-    }
-  })
+  match config {
+    Config::Server(server_config) => run_server(server_config).await,
+    Config::Client(client_config) => run_client(client_config, &cli.config).await,
+  }
 }

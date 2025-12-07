@@ -8,18 +8,14 @@ use std::{
   time::Duration,
 };
 
-use futures::{
-  AsyncReadExt,
-  future::{Either, select},
-  io::copy,
-};
+use futures::future::{Either, select};
 use quinn::{
   ClientConfig, Endpoint, IdleTimeout, RecvStream, SendStream, TransportConfig, VarInt,
   crypto::rustls::QuicClientConfig,
 };
 
 use rustls::pki_types::CertificateDer;
-use smol::net::TcpStream;
+use tokio::{io::copy, net::TcpStream};
 use tracing::{debug, info, warn};
 
 use crate::config::{ClientConfig as Config, VERSION_MAJOR};
@@ -55,9 +51,9 @@ pub async fn run_client(config: Config, _config_path: &str) -> anyhow::Result<()
     let (mut tx_r, mut tx_s) = connection.accept_bi().await?;
     debug!("BI Stream from server accepted");
 
-    smol::spawn(async move {
+    tokio::spawn(async move {
       let backend_addr = "192.168.1.20:8082";
-      let tcp_stream = match smol::net::TcpStream::connect(backend_addr).await {
+      let tcp_stream = match tokio::net::TcpStream::connect(backend_addr).await {
         Ok(tcp_stream) => tcp_stream,
         Err(e) => {
           warn!("Failed to connect to backend: {}", e);
@@ -66,13 +62,12 @@ pub async fn run_client(config: Config, _config_path: &str) -> anyhow::Result<()
       };
       let result = proxy_quic_to_tcp(tcp_stream, &mut tx_r, &mut tx_s).await;
       debug!("result {:?}", result);
-    })
-    .detach();
+    });
   }
 }
 
 async fn proxy_quic_to_tcp(
-  tcp: TcpStream,
+  mut tcp: TcpStream,
   quic_send: &mut SendStream,
   quic_recv: &mut RecvStream,
 ) -> anyhow::Result<()> {
