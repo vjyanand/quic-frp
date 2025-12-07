@@ -54,16 +54,20 @@ pub async fn run_client(config: Config, _config_path: &str) -> anyhow::Result<()
     debug!("trying BI Stream from server");
     let (mut tx_r, mut tx_s) = connection.accept_bi().await?;
     debug!("BI Stream from server accepted");
-    let backend_addr = "192.168.1.20:8082";
 
-    let tcp_stream = match smol::net::TcpStream::connect(backend_addr).await {
-      Ok(tcp_stream) => tcp_stream,
-      Err(e) => {
-        warn!("Failed to connect to backend: {}", e);
-        return Err(e.into());
-      }
-    };
-    proxy_quic_to_tcp(tcp_stream, &mut tx_r, &mut tx_s).await?;
+    smol::spawn(async move {
+      let backend_addr = "192.168.1.20:8082";
+      let tcp_stream = match smol::net::TcpStream::connect(backend_addr).await {
+        Ok(tcp_stream) => tcp_stream,
+        Err(e) => {
+          warn!("Failed to connect to backend: {}", e);
+          return;
+        }
+      };
+      let result = proxy_quic_to_tcp(tcp_stream, &mut tx_r, &mut tx_s).await;
+      debug!("result {:?}", result);
+    })
+    .detach();
   }
 }
 
@@ -142,8 +146,8 @@ fn load_root_certs(cert_path: Option<&PathBuf>) -> anyhow::Result<rustls::RootCe
 fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
   let mut config = TransportConfig::default();
 
-  config.keep_alive_interval(Some(Duration::from_secs(45)));
-  config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(20))?));
+  config.keep_alive_interval(Some(Duration::from_secs(5)));
+  config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(40))?));
   config.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
 
   Ok(Arc::new(config))

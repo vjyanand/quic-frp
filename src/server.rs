@@ -47,12 +47,15 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
   let runtime = default_runtime().unwrap();
   let endpoint = Endpoint::new(endpoinf_config, Some(server_config), socket, runtime)?;
   info!("Server listening on {}", endpoint.local_addr()?);
-
-  let incoming = endpoint.accept().await.unwrap();
-  debug!("New incoming connection {}", incoming.remote_address());
-
-  handle_connection(incoming).await?;
-  Ok(())
+  loop {
+    let incoming = endpoint.accept().await.unwrap();
+    debug!("New incoming connection {}", incoming.remote_address());
+    smol::spawn(async move {
+      let result = handle_connection(incoming).await;
+      debug!("result: {:?}", result);
+    })
+    .detach();
+  }
 }
 
 async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
@@ -68,7 +71,7 @@ async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
   let bind_address = format!("0.0.0.0:{}", "7071");
   let bin = bind_address.parse::<std::net::SocketAddr>()?.into();
   socket.bind(&bin)?;
-  socket.listen(128)?; // <-- THIS WAS MISSING!
+  socket.listen(128)?;
 
   let std_listener: std::net::TcpListener = socket.into();
   std_listener.set_nonblocking(true)?;
@@ -80,7 +83,8 @@ async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
     debug!("New TCP connection from: {}", peer_addr);
     let l_connection = connection.clone();
     smol::spawn(async move {
-      let _result = handle_client(&l_connection, stream).await;
+      let result = handle_client(&l_connection, stream).await;
+      debug!("result2: {:?}", result);
     })
     .detach();
     debug!("Ends");
@@ -97,7 +101,7 @@ async fn handle_client(connection: &quinn::Connection, stream: smol::net::TcpStr
     }
   };
   proxy_tcp_to_quic(stream, &mut tx_stream, &mut tr_stream).await;
-  return Ok(());
+  Ok(())
 }
 
 async fn proxy_tcp_to_quic(tcp: smol::net::TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
@@ -142,10 +146,10 @@ fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
   let mut transport = TransportConfig::default();
 
   // Keep-alive to detect dead connections
-  transport.keep_alive_interval(Some(Duration::from_secs(45)));
+  transport.keep_alive_interval(Some(Duration::from_secs(5)));
 
   // Longer idle timeout for server (handles multiple clients)
-  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(60))?));
+  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(40))?));
 
   // High stream limit for busy proxies
   transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
