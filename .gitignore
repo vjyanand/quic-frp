@@ -7,3 +7,7 @@ client.toml
 .vscode
 /.idea
 .DS_Store
+localhost.crt
+.gitignore
+client_another.toml
+localhost.key
