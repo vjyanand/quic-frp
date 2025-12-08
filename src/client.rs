@@ -9,7 +9,7 @@ use std::{
 use compio::io::copy;
 use compio_net::{TcpOpts, TcpStream};
 use compio_quic::{
-  ClientBuilder, Connection, Endpoint, IdleTimeout, RecvStream, SendStream, VarInt,
+  ClientBuilder, Connection, Endpoint, IdleTimeout, RecvStream, SendStream, VarInt, congestion,
 };
 use compio_signal::ctrl_c;
 use dashmap::DashMap;
@@ -117,21 +117,21 @@ fn resolve_server_addr(
 }
 
 fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>> {
-  let mut config = compio_quic::TransportConfig::default();
+  let mut transport = compio_quic::TransportConfig::default();
 
-  config.keep_alive_interval(Some(Duration::from_secs(5)));
-  config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10))?));
-  config.max_concurrent_bidi_streams(VarInt::from_u64(100)?); // Increased from 10
-
+  transport.keep_alive_interval(Some(Duration::from_secs(5)));
+  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10))?));
+  transport.max_concurrent_bidi_streams(VarInt::from_u64(100)?); // Increased from 10
+  transport.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
   // Flow control tuning for better throughput
-  config.send_window(4 * 1024 * 1024); // 4MB send window
-  config.stream_receive_window(VarInt::from_u64(1024 * 1024)?); // 1MB per stream
-  config.receive_window(VarInt::from_u64(8 * 1024 * 1024)?); // 8MB total
+  transport.send_window(4 * 1024 * 1024); // 4MB send window
+  transport.stream_receive_window(VarInt::from_u64(1024 * 1024)?); // 1MB per stream
+  transport.receive_window(VarInt::from_u64(8 * 1024 * 1024)?); // 8MB total
 
   // Initial RTT estimate (can help with initial congestion window)
-  config.initial_rtt(Duration::from_millis(100));
+  transport.initial_rtt(Duration::from_millis(100));
 
-  Ok(Arc::new(config))
+  Ok(Arc::new(transport))
 }
 
 async fn connect_to_server(
