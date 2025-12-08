@@ -155,6 +155,8 @@ fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>
   transport.stream_receive_window(VarInt::from_u64(2 * 1024 * 1024)?); // 2MB per stream
   transport.receive_window(VarInt::from_u64(16 * 1024 * 1024)?); // 16MB total receive
 
+  transport.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
+
   Ok(Arc::new(transport))
 }
 
