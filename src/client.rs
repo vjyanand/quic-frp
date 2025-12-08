@@ -51,9 +51,9 @@ pub async fn run_client(config: Config, _config_path: &str) -> anyhow::Result<()
   let connection = endpoint.connect_with(client_config, server_addr, "localhost")?.await?;
   debug!("Connected");
   loop {
-    debug!("trying BI Stream from server");
+    debug!("waiting for bi-di stream from server");
     let (mut tx_r, mut tx_s) = connection.accept_bi().await?;
-    debug!("BI Stream from server accepted");
+    debug!("new bi-di stream from server accepted");
 
     smol::spawn(async move {
       let backend_addr = "192.168.1.20:8082";

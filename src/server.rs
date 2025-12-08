@@ -92,7 +92,7 @@ async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
 }
 
 async fn handle_client(connection: &quinn::Connection, stream: smol::net::TcpStream) -> anyhow::Result<()> {
-  debug!("OPening bi-stream");
+  debug!("Opening bi-stream");
   let (mut tx_stream, mut tr_stream) = match connection.open_bi().await {
     Ok(stream) => stream,
     Err(e) => {
