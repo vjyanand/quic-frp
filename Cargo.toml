@@ -34,5 +34,5 @@ uuid = {version = "1.19.0", features=["v4"]}
 
 [profile.release]
 opt-level = "z"
-#strip = true
-debug = true
+strip = true
+#debug = true
