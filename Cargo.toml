@@ -17,7 +17,7 @@ rustls-native-certs = "0.8.2"
 rustls-pemfile = "2.2.0"
 serde = {version = "1.0.228", features=["serde_derive"]}
 socket2 = "0.6.1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.48", features = ["full"] }
 toml = "0.9.8"
 tracing = "0.1.43"
 tracing-subscriber = {version = "0.3.22" , default-features = false, features = ["fmt", "env-filter"]}

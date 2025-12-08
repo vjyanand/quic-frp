@@ -1,8 +1,6 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use futures::
-  future::{Either, select}
-;
+use futures::future::{Either, select};
 use quinn::{
   Endpoint, EndpointConfig, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
   crypto::rustls::QuicServerConfig, default_runtime,
@@ -149,6 +147,8 @@ fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
 
   // High stream limit for busy proxies
   transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
+
+  transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
   Ok(Arc::new(transport))
 }

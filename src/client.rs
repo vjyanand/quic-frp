@@ -139,13 +139,13 @@ fn load_root_certs(cert_path: Option<&PathBuf>) -> anyhow::Result<rustls::RootCe
 }
 
 fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
-  let mut config = TransportConfig::default();
+  let mut transport = TransportConfig::default();
 
-  config.keep_alive_interval(Some(Duration::from_secs(5)));
-  config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(40))?));
-  config.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
-
-  Ok(Arc::new(config))
+  transport.keep_alive_interval(Some(Duration::from_secs(5)));
+  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(40))?));
+  transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
+  transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+  Ok(Arc::new(transport))
 }
 // =============================================================================
 // QUIC Connection Setup
