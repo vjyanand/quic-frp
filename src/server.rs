@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use compio::io::copy;
 use compio_net::{TcpListener, TcpOpts, TcpStream};
 use compio_quic::{
-  Connection, Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, VarInt, congestion,
+  Connection, Endpoint, EndpointConfig, ServerBuilder, VarInt, congestion,
 };
 use dashmap::DashMap;
 use futures::future::{Either, select};
@@ -148,8 +148,6 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
 
 fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>> {
   let mut transport = compio_quic::TransportConfig::default();
-  transport.keep_alive_interval(Some(Duration::from_secs(5)));
-  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10))?));
   transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
   transport.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
   // Additional optimizations
