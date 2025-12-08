@@ -2,34 +2,32 @@
 
 use std::path::PathBuf;
 
-use bincode::{Decode, Encode, encode_to_vec};
-use compio_quic::{RecvStream, SendStream};
-use log::trace;
+use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 pub const VERSION_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
 
 #[derive(Debug, Clone, Encode, Decode, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct ServiceDefinition {
-  pub service_name: String,
   pub local_addr: String,
+  pub name: String,
   pub remote_port: u16,
 }
 
 #[derive(Debug, Clone, Encode, Deserialize)]
 pub struct ClientConfig {
-  pub remote_addr: String,
   pub prefer_ipv6: Option<bool>,
+  pub remote_addr: String,
   pub retry_interval: Option<u64>,
-  pub token: Option<String>,
   pub services: Vec<ServiceDefinition>,
+  pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-  pub listen_addr: String,
   pub cert: Option<PathBuf>,
   pub key: Option<PathBuf>,
+  pub listen_addr: String,
   pub token: Option<String>,
 }
 
@@ -67,33 +65,4 @@ impl Config {
     let root: ClientRootConfig = toml::from_str(&content)?;
     Ok(root.client)
   }
-}
-
-/// Writes a framed control message to a *unidirectional* or *bidi* SendStream.
-pub async fn control_write_frame<T: Encode>(
-  stream: &mut SendStream,
-  frame: &T,
-) -> anyhow::Result<()> {
-  let serialized = encode_to_vec(frame, bincode::config::standard())?;
-  let len = (serialized.len() as u32).to_be_bytes();
-  trace!("Writing frame of length {:?}", len);
-  // Write 4-byte length
-  stream.write_all(&len).await?;
-  // Write payload
-  stream.write_all(&serialized).await?;
-  Ok(())
-}
-
-/// Reads exactly one framed control message.
-pub async fn control_read_frame<T: bincode::Decode<()>>(
-  stream: &mut RecvStream,
-) -> anyhow::Result<T> {
-  let mut len_buf = [0u8; 4];
-  stream.read_exact(&mut len_buf[..]).await?;
-  let frame_len = u32::from_be_bytes(len_buf) as usize;
-  trace!("Reading frame of length {}", frame_len);
-  let mut buf = vec![0u8; frame_len];
-  stream.read_exact(&mut buf[..]).await?;
-  let (frame, _) = bincode::decode_from_slice::<T, _>(&buf, bincode::config::standard())?;
-  Ok(frame)
 }

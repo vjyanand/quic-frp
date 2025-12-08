@@ -1,5 +1,6 @@
 use clap::Parser;
-use log::debug;
+use tracing::debug;
+use tracing_subscriber::{EnvFilter, FmtSubscriber, fmt::format::FmtSpan};
 
 use crate::{cli::Cli, client::run_client, config::Config, server::run_server};
 
@@ -13,7 +14,11 @@ mod tls;
 
 #[compio::main]
 async fn main() -> anyhow::Result<()> {
-  env_logger::init();
+  FmtSubscriber::builder()
+    .with_env_filter(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info")))
+    .with_span_events(FmtSpan::CLOSE)
+    .init();
+
   let cli = Cli::try_parse()?;
   debug!("Using config file {}", cli.config);
   let config = Config::load(&cli.config)?;
