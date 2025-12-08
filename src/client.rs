@@ -132,7 +132,7 @@ fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>
   transport.keep_alive_interval(Some(Duration::from_secs(5)));
   transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(20))?));
   transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
-  transport.congestion_controller_factory(Arc::new(congestion::NewRenoConfig::default()));
+  transport.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
   Ok(Arc::new(transport))
 }
 

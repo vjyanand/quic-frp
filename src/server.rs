@@ -150,7 +150,7 @@ fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>
   // High stream limit for busy proxies
   transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
 
-  transport.congestion_controller_factory(Arc::new(congestion::NewRenoConfig::default()));
+  transport.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
 
   Ok(Arc::new(transport))
 }
