@@ -10,6 +10,7 @@ use compio::io::copy;
 use compio_net::{TcpOpts, TcpStream};
 use compio_quic::{
   ClientBuilder, Connection, Endpoint, IdleTimeout, RecvStream, SendStream, VarInt,
+  congestion,
 };
 use compio_signal::ctrl_c;
 use dashmap::DashMap;
@@ -126,13 +127,13 @@ fn resolve_server_addr(
 
 /// Create transport config for client
 fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>> {
-  let mut config = compio_quic::TransportConfig::default();
+  let mut transport = compio_quic::TransportConfig::default();
 
-  config.keep_alive_interval(Some(Duration::from_secs(5)));
-  config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(20))?));
-  config.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
-
-  Ok(Arc::new(config))
+  transport.keep_alive_interval(Some(Duration::from_secs(5)));
+  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(20))?));
+  transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
+  transport.congestion_controller_factory(Arc::new(congestion::NewRenoConfig::default()));
+  Ok(Arc::new(transport))
 }
 
 /// Establish QUIC connection to server

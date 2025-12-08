@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use compio::io::copy;
 use compio_net::{TcpListener, TcpOpts, TcpStream};
 use compio_quic::{
-  Connection, Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, VarInt,
+  Connection, Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, VarInt, congestion,
 };
 use dashmap::DashMap;
 use futures::future::{Either, select};
@@ -149,6 +149,8 @@ fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>
 
   // High stream limit for busy proxies
   transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
+
+  transport.congestion_controller_factory(Arc::new(congestion::NewRenoConfig::default()));
 
   Ok(Arc::new(transport))
 }
