@@ -10,20 +10,25 @@ clap = { version = "4.5.53", features = ["derive"] }
 dashmap = "6.1.0"
 futures = "0.3.31"
 notify = "8.2.0"
-quinn = { version = "0.11.9"}
+quinn = { version = "0.11.9" }
 rcgen = "0.14.6"
-rustls = { version = "0.23.35", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23.35", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
 rustls-native-certs = "0.8.2"
 rustls-pemfile = "2.2.0"
-serde = {version = "1.0.228", features=["serde_derive"]}
+serde = { version = "1.0.228", features = ["serde_derive"] }
 socket2 = "0.6.1"
-tokio = { version = "1.48", features = ["full"] }
+tokio = { version = "1.48", default-features = false, features = ["macros", "rt-multi-thread", "io-util"] }
 toml = "0.9.8"
 tracing = "0.1.44"
-tracing-subscriber = {version = "0.3.22" , default-features = false, features = ["fmt", "env-filter"]}
-uuid = {version = "1.19.0", features=["v4"]}
+tracing-subscriber = { version = "0.3.22", default-features = false, features = [
+    "fmt",
+    "env-filter",
+] }
+uuid = { version = "1.19.0", features = ["v4"] }
 
 [profile.release]
 opt-level = "z"
 strip = true
-
