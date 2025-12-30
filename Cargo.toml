@@ -5,34 +5,35 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
-bincode = "2.0.1"
+bitcode = "0.6.9"
 clap = { version = "4.5.53", features = ["derive"] }
-compio = { version = "0.17.0", features = [
-    "runtime",
-    "macros",
-    "io-uring",
-    "time",
-    "rustls"
-] }
-
-compio-net = { version = "0.10.0" }
-compio-quic = { version = "0.6.0", default-features = false, features = ["ring", "native-certs", "platform-verifier"] }
-compio-signal = { version = "0.8.0"}
 dashmap = "6.1.0"
 futures = "0.3.31"
-libc = "0.2.178"
 notify = "8.2.0"
-rcgen = "0.14.5"
-rustls = { version = "0.23.35", default-features = false, features = ["ring", "tls12"] }
+quinn = "0.11.9"
+rcgen = "0.14.6"
+rustls = { version = "0.23.35", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8.3"
 rustls-pemfile = "2.2.0"
-serde = {version = "1.0.228", features=["serde_derive"]}
+serde = { version = "1.0.228", features = ["serde_derive"] }
 socket2 = "0.6.1"
-toml = "0.9.8"
-tracing = "0.1.43"
-tracing-subscriber = {version = "0.3.22" , default-features = false, features = ["fmt", "env-filter"]}
-uuid = {version = "1.19.0", features=["v4"]}
+tokio = { version = "1.48", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+    "io-util",
+    "signal",
+] }
+toml = "0.9.10"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", default-features = false, features = [
+    "fmt",
+    "env-filter",
+] }
+uuid = { version = "1.19.0", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.178"
 
 [profile.release]
 opt-level = "z"
 strip = true
-#debug = true

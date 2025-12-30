@@ -1,8 +1,6 @@
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
-use bincode::{Decode, Encode};
+use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 pub const VERSION_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
@@ -14,13 +12,14 @@ pub struct ServiceDefinition {
   pub remote_port: u16,
 }
 
-#[derive(Debug, Clone, Encode, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ClientConfig {
   pub prefer_ipv6: Option<bool>,
   pub remote_addr: String,
   pub retry_interval: Option<u64>,
   pub services: Vec<ServiceDefinition>,
   pub token: Option<String>,
+  pub cert: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,52 +1,55 @@
 use std::{
   collections::HashSet,
   net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+  path::PathBuf,
   pin::pin,
   sync::Arc,
   time::Duration,
 };
 
-use compio::io::copy;
-use compio_net::{TcpOpts, TcpStream};
-use compio_quic::{ClientBuilder, Connection, Endpoint, IdleTimeout, RecvStream, SendStream, VarInt, congestion};
-use compio_signal::ctrl_c;
 use dashmap::DashMap;
 use futures::future::{Either, select};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use quinn::{
+  Connection, Endpoint, IdleTimeout, RecvStream, SendStream, TransportConfig, VarInt, congestion,
+  crypto::rustls::QuicClientConfig,
+};
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::{io::copy, task::JoinHandle};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
   backoff::ExponentialBackoff,
-  config::{ClientConfig, Config, ServiceDefinition, VERSION_MAJOR},
-  protocol::{ClientControlMessage, ServerControlMessage, read_frame, read_port_header, write_frame},
+  config::{Config, ServiceDefinition, VERSION_MAJOR},
+  protocol::{ClientControlMessage, ServerAckMessage, read_frame, read_port_header, write_frame},
+  tls::TlsClientCertConfig,
 };
 
 type ServiceRegistry = Arc<DashMap<u16, ServiceDefinition>>;
 
 /// Client entry point
-pub async fn run_client(config: ClientConfig, config_path: &str) -> anyhow::Result<()> {
+pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) -> anyhow::Result<()> {
   info!("Client connecting to {}", config.remote_addr);
-
-  let (server_addr, local_bind) = resolve_server_addr(&config)?;
-  let endpoint = Endpoint::client(local_bind).await?;
-  let transport_config = create_transport_config()?;
 
   let retry_secs = config.retry_interval.unwrap_or(5);
   let mut backoff = ExponentialBackoff::new(Duration::from_secs(retry_secs), Duration::from_secs(30));
 
-  // Pre-allocate with expected capacity
-  let services: ServiceRegistry = Arc::new(DashMap::with_capacity(config.services.len()));
-  for svc in config.services {
-    services.insert(svc.remote_port, svc);
-  }
-
-  let alpn = match config.token {
-    Some(token) => format!("quic-proxy-{}-{}", VERSION_MAJOR, token),
+  let alpn = match &config.token {
+    Some(token) => format!("quic-proxy-{}-{}", VERSION_MAJOR, token.clone()),
     None => format!("quic-proxy-{}", VERSION_MAJOR),
   };
 
+  let (server_addr, local_bind) = resolve_server_addr(&config)?;
+
+  // Pre-allocate with expected capacity
+  let services = DashMap::with_capacity(config.services.len());
+  for svc in config.services {
+    services.insert(svc.remote_port, svc);
+  }
+  let services = Arc::new(services);
+
   loop {
-    match connect_to_server(&endpoint, server_addr, &alpn, &transport_config).await {
+    match connect_to_server(server_addr, local_bind, &alpn, config.cert.clone()).await {
       Ok(conn) => {
         info!("Connected to server");
         backoff.reset();
@@ -67,7 +70,7 @@ pub async fn run_client(config: ClientConfig, config_path: &str) -> anyhow::Resu
       Err(e) => {
         let delay = backoff.next_delay();
         warn!("Connection failed: {}, retrying in {}s", e, delay.as_secs());
-        compio::time::sleep(delay).await;
+        tokio::time::sleep(delay).await;
       }
     }
   }
@@ -85,7 +88,7 @@ enum LoopControl {
 // =============================================================================
 
 #[inline]
-fn resolve_server_addr(config: &ClientConfig) -> anyhow::Result<(SocketAddr, SocketAddr)> {
+fn resolve_server_addr(config: &crate::config::ClientConfig) -> anyhow::Result<(SocketAddr, SocketAddr)> {
   let prefer_v6 = config.prefer_ipv6.unwrap_or(false);
   let addrs: Vec<_> = config.remote_addr.to_socket_addrs()?.collect();
 
@@ -105,8 +108,8 @@ fn resolve_server_addr(config: &ClientConfig) -> anyhow::Result<(SocketAddr, Soc
   Ok((chosen, local_bind))
 }
 
-fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>> {
-  let mut transport = compio_quic::TransportConfig::default();
+fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
+  let mut transport = TransportConfig::default();
 
   transport.keep_alive_interval(Some(Duration::from_secs(5)));
   transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10))?));
@@ -124,16 +127,25 @@ fn create_transport_config() -> anyhow::Result<Arc<compio_quic::TransportConfig>
 }
 
 async fn connect_to_server(
-  endpoint: &Endpoint,
   server_addr: SocketAddr,
+  local_bind: SocketAddr,
   alpn: &str,
-  transport_config: &Arc<compio_quic::TransportConfig>,
+  config: Option<PathBuf>,
 ) -> anyhow::Result<Connection> {
-  let mut client_config = ClientBuilder::new_with_no_server_verification().with_alpn_protocols(&[alpn]).build();
+  let mut client_crypto = TlsClientCertConfig::SystemRoot { extra_ca: config }.into_client_config()?;
 
-  client_config.transport_config(Arc::clone(transport_config));
+  client_crypto.alpn_protocols = vec![alpn.into()];
 
-  endpoint.connect(server_addr, "localhost", Some(client_config))?.await.map_err(Into::into)
+  let quic_config = QuicClientConfig::try_from(client_crypto)?;
+  let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+
+  let transport_config = create_transport_config()?;
+  client_config.transport_config(transport_config);
+
+  let endpoint = Endpoint::client(local_bind)?;
+  debug!("End point created");
+  let connection = endpoint.connect_with(client_config, server_addr, "localhost")?.await?;
+  Ok(connection)
 }
 
 // =============================================================================
@@ -145,15 +157,15 @@ async fn handle_connection(
   services: &ServiceRegistry,
   config_path: &str,
 ) -> anyhow::Result<LoopControl> {
-  let (mut ctrl_send, mut ctrl_recv) = conn.open_bi()?;
+  let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
   debug!("Control stream opened");
 
   register_services(&mut ctrl_send, services).await?;
 
   let services_ref = Arc::clone(services);
-  let accept_task = compio::runtime::spawn(async move { accept_data_streams(conn, services_ref).await });
+  let accept_task = tokio::spawn(async move { accept_data_streams(conn, services_ref).await });
 
-  let quic_ctrl_task = compio::runtime::spawn(async move {
+  let quic_ctrl_task = tokio::spawn(async move {
     receive_control_messages(&mut ctrl_recv).await;
     true
   });
@@ -166,11 +178,12 @@ async fn handle_connection(
 
   // Best-effort cleanup - batch unregister messages
   for svc in services.iter() {
-    let _ = write_frame(&mut ctrl_send, &ClientControlMessage::UnregisterService(svc.clone())).await;
+    let svc = svc.clone();
+    let _ = write_frame(&mut ctrl_send, &ClientControlMessage::DeregisterService(svc)).await;
   }
   let _ = ctrl_send.finish();
 
-  accept_task.cancel().await;
+  accept_task.abort();
 
   result
 }
@@ -180,7 +193,7 @@ async fn event_loop_with_connection_monitor(
   services: &ServiceRegistry,
   config_path: &str,
   reload_rx: std::sync::mpsc::Receiver<()>,
-  quic_ctrl_task: compio::runtime::JoinHandle<bool>,
+  quic_ctrl_task: JoinHandle<bool>,
 ) -> anyhow::Result<LoopControl> {
   let mut conn_dead = pin!(quic_ctrl_task);
   let poll_interval = Duration::from_millis(500);
@@ -199,8 +212,8 @@ async fn event_loop_with_connection_monitor(
       }
     }
 
-    let ctrl_c_fut = pin!(ctrl_c());
-    let sleep_fut = pin!(compio::time::sleep(poll_interval));
+    let ctrl_c_fut = pin!(tokio::signal::ctrl_c());
+    let sleep_fut = pin!(tokio::time::sleep(poll_interval));
     let conn_check = pin!(async { (&mut conn_dead).await });
 
     let ctrl_c_or_sleep = pin!(select(ctrl_c_fut, sleep_fut));
@@ -257,9 +270,9 @@ async fn handle_config_reload(
 
   // Unregister removed services
   for port in to_remove {
-    if let Some((_, svc)) = services.remove(&port) {
-      info!("Unregistering removed service: {}", svc.name);
-      write_frame(ctrl_send, &ClientControlMessage::UnregisterService(svc)).await?;
+    if let Some(svc) = services.remove(&port) {
+      info!("Unregistering removed service: {}", svc.1.name);
+      write_frame(ctrl_send, &ClientControlMessage::DeregisterService(svc.1)).await?;
     }
   }
 
@@ -271,9 +284,9 @@ async fn handle_config_reload(
       services.insert(svc.remote_port, svc);
     } else if let Some(mut entry) = services.get_mut(&svc.remote_port) {
       // Update existing service if local_addr changed
-      if entry.value().local_addr != svc.local_addr {
-        info!("Updating service {} local_addr: {} -> {}", svc.name, entry.value().local_addr, svc.local_addr);
-        *entry.value_mut() = svc;
+      if entry.local_addr != svc.local_addr {
+        info!("Updating service {} local_addr: {} -> {}", svc.name, entry.local_addr, svc.local_addr);
+        *entry = svc;
       }
     }
   }
@@ -282,13 +295,9 @@ async fn handle_config_reload(
   Ok(())
 }
 
-// =============================================================================
-// Service Registration
-// =============================================================================
-
 async fn register_services(ctrl_send: &mut SendStream, services: &ServiceRegistry) -> anyhow::Result<()> {
   for svc in services.iter() {
-    let msg = ClientControlMessage::RegisterService(svc.value().clone());
+    let msg = ClientControlMessage::RegisterService(svc.clone());
     if let Err(e) = write_frame(ctrl_send, &msg).await {
       warn!("Failed to register {}: {}", svc.name, e);
     } else {
@@ -300,16 +309,16 @@ async fn register_services(ctrl_send: &mut SendStream, services: &ServiceRegistr
 
 async fn receive_control_messages(ctrl_recv: &mut RecvStream) {
   loop {
-    match read_frame::<ServerControlMessage>(ctrl_recv).await {
+    match read_frame::<ServerAckMessage>(ctrl_recv).await {
       Ok(msg) => match msg {
-        ServerControlMessage::ServiceRegistered { service_name, success, error } => {
+        ServerAckMessage::ServiceRegistered { service_name, success, error } => {
           if success {
             info!("Service '{}' registered", service_name);
           } else {
             warn!("Service '{}' registration failed: {:?}", service_name, error);
           }
         }
-        ServerControlMessage::ServiceUnregistered { service_name, success, .. } => {
+        ServerAckMessage::ServiceUnregistered { service_name, success, .. } => {
           if success {
             info!("Service '{}' unregistered", service_name);
           }
@@ -334,7 +343,7 @@ async fn accept_data_streams(conn: Connection, services: ServiceRegistry) {
         debug!("Accepted data stream from server");
         let services_clone = Arc::clone(&services);
 
-        compio::runtime::spawn(async move {
+        tokio::spawn(async move {
           match handle_data_stream(&mut quic_send, &mut quic_recv, &services_clone).await {
             Ok(()) => {}
             Err(e) => {
@@ -349,8 +358,7 @@ async fn accept_data_streams(conn: Connection, services: ServiceRegistry) {
               }
             }
           }
-        })
-        .detach();
+        });
       }
       Err(e) => {
         debug!("Accept stream failed: {}", e);
@@ -376,21 +384,26 @@ async fn handle_data_stream(
 
   debug!("Proxying to local service: {} ({})", service_name, local_addr);
 
-  // TCP connection options
-  let opts = TcpOpts::new()
-    .nodelay(true)
-    .keepalive(true)
-    .write_timeout(Duration::from_secs(5))
-    .read_timeout(Duration::from_secs(5));
+  let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+  socket.set_keepalive(true)?;
+  socket.set_tcp_nodelay(true)?;
+  let keepalive = socket2::TcpKeepalive::new()
+    .with_interval(Duration::from_secs(10))
+    .with_retries(5)
+    .with_time(Duration::from_secs(60));
+  socket.set_tcp_keepalive(&keepalive)?;
 
-  let local_tcp = TcpStream::connect_with_options(&local_addr, opts).await?;
+  let sock_addr = socket2::SockAddr::from(local_addr.to_socket_addrs()?.next().unwrap());
+  socket.connect(&sock_addr)?;
+  let std_tcp: std::net::TcpStream = socket.into();
+  let local_tcp: tokio::net::TcpStream = tokio::net::TcpStream::from_std(std_tcp)?;
   debug!("Connected to local service: {}", local_addr);
 
   proxy_quic_to_tcp(local_tcp, quic_send, quic_recv).await;
   Ok(())
 }
 
-async fn proxy_quic_to_tcp(tcp: TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
+async fn proxy_quic_to_tcp(mut tcp: tokio::net::TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
   let (mut tcp_r, mut tcp_w) = tcp.split();
 
   let upstream = async {
