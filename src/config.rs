@@ -12,7 +12,7 @@ pub struct ServiceDefinition {
   pub remote_port: u16,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ClientConfig {
   pub prefer_ipv6: Option<bool>,
   pub remote_addr: String,
@@ -22,7 +22,7 @@ pub struct ClientConfig {
   pub cert: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ServerConfig {
   pub cert: Option<PathBuf>,
   pub key: Option<PathBuf>,
@@ -30,12 +30,12 @@ pub struct ServerConfig {
   pub token: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ServerRootConfig {
   pub server: ServerConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ClientRootConfig {
   pub client: ClientConfig,
 }
