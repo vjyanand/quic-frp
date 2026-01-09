@@ -6,9 +6,8 @@ use crate::{
 };
 use dashmap::DashMap;
 use futures::future::{Either, select};
-use quinn::RecvStream;
 use quinn::{
-  Connection, Endpoint, EndpointConfig, IdleTimeout, SendStream, ServerConfig, TransportConfig, VarInt,
+  Connection, Endpoint, EndpointConfig, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
   crypto::rustls::QuicServerConfig, default_runtime,
 };
 use socket2::{Domain, Protocol, Socket, Type};
@@ -23,9 +22,9 @@ type PortRegistry = Arc<DashMap<u16, PortBinding>>;
 pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<()> {
   info!("server starting on {}", config.listen_addr);
 
-  let (cert_der, key_der) = match (config.cert, config.key) {
-    (Some(cert), Some(key)) => TlsServerCertConfig::from_pem_files(cert, key).load()?,
-    _ => TlsServerCertConfig::self_signed(vec!["localhost"]).load()?,
+  let mut server_crypto = match (config.cert, config.key) {
+    (Some(cert), Some(key)) => TlsServerCertConfig::from_pem_files(cert, key).into_server_config()?,
+    _ => TlsServerCertConfig::self_signed(vec!["localhost"]).into_server_config()?,
   };
 
   let alpn = match config.token {
@@ -33,7 +32,6 @@ pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<(
     None => format!("quic-proxy-{}", VERSION_MAJOR).into_bytes(),
   };
 
-  let mut server_crypto = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(cert_der, key_der)?;
   server_crypto.alpn_protocols = vec![alpn];
   let server_crypto = Arc::new(QuicServerConfig::try_from(server_crypto)?);
 
@@ -76,7 +74,7 @@ async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) ->
   debug!("Control stream established for {}", client_identity);
 
   loop {
-    match read_frame::<ClientControlMessage>(&mut control_recv).await {
+    match read_frame::<ClientControlMessage, _>(&mut control_recv).await {
       Ok(ClientControlMessage::RegisterService(def)) => {
         handle_register_service(def, &connection, &mut control_send, &client_identity, &registry).await?;
       }
@@ -435,7 +433,6 @@ fn configure_linux_socket(socket: &Socket) {
     )
   };
 }
-
 
 struct PortBinding {
   client_identity: ClientIdentity,

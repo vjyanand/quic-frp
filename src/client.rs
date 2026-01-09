@@ -1,7 +1,6 @@
 use std::{
   collections::HashSet,
   net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
-  path::PathBuf,
   pin::pin,
   sync::Arc,
   time::Duration,
@@ -47,9 +46,9 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
     services.insert(svc.remote_port, svc);
   }
   let services = Arc::new(services);
-
+  let tls_config = config.tls;
   loop {
-    match connect_to_server(server_addr, local_bind, &alpn, config.cert.clone()).await {
+    match connect_to_server(server_addr, local_bind, &alpn, tls_config.clone()).await {
       Ok(conn) => {
         info!("Connected to server");
         backoff.reset();
@@ -130,9 +129,9 @@ async fn connect_to_server(
   server_addr: SocketAddr,
   local_bind: SocketAddr,
   alpn: &str,
-  config: Option<PathBuf>,
+  tls: TlsClientCertConfig,
 ) -> anyhow::Result<Connection> {
-  let mut client_crypto = TlsClientCertConfig::SystemRoot { extra_ca: config }.into_client_config()?;
+  let mut client_crypto = tls.into_client_config()?;
 
   client_crypto.alpn_protocols = vec![alpn.into()];
 
@@ -309,7 +308,7 @@ async fn register_services(ctrl_send: &mut SendStream, services: &ServiceRegistr
 
 async fn receive_control_messages(ctrl_recv: &mut RecvStream) {
   loop {
-    match read_frame::<ServerAckMessage>(ctrl_recv).await {
+    match read_frame::<ServerAckMessage, _>(ctrl_recv).await {
       Ok(msg) => match msg {
         ServerAckMessage::ServiceRegistered { service_name, success, error } => {
           if success {
@@ -392,10 +391,10 @@ async fn handle_data_stream(
     .with_retries(5)
     .with_time(Duration::from_secs(60));
   socket.set_tcp_keepalive(&keepalive)?;
-
   let sock_addr = socket2::SockAddr::from(local_addr.to_socket_addrs()?.next().unwrap());
   socket.connect(&sock_addr)?;
   let std_tcp: std::net::TcpStream = socket.into();
+  let _ = std_tcp.set_nonblocking(true);
   let local_tcp: tokio::net::TcpStream = tokio::net::TcpStream::from_std(std_tcp)?;
   debug!("Connected to local service: {}", local_addr);
 
