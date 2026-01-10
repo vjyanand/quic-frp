@@ -193,10 +193,14 @@ async fn register_service(
 async fn create_tcp_listener_with_retry(service: &ServiceDefinition, max_retries: u32) -> anyhow::Result<TcpListener> {
   let mut last_error = None;
   let retry_delay = Duration::from_millis(100);
-  let bind_addr = format!("0.0.0.0:{}", service.remote_port);
+
+  let (domain, bind_addr) = match service.prefer_ipv6.unwrap_or_default() {
+    true => (Domain::IPV6, format!("[::]:{}", service.remote_port)),
+    false => (Domain::IPV4, format!("0.0.0.0:{}", service.remote_port)),
+  };
 
   for attempt in 0..=max_retries {
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_tcp_nodelay(true)?;
     socket.set_nonblocking(true)?;
     socket.set_reuse_address(true)?;
@@ -257,6 +261,7 @@ async fn handle_tcp_connection(
   port: u16,
   peer_addr: SocketAddr,
 ) -> anyhow::Result<()> {
+  debug!("Opening QUIC stream for TCP peer {}", peer_addr);
   let (mut quic_send, mut quic_recv) =
     conn.open_bi().await.map_err(|e| anyhow::anyhow!("Failed to open QUIC stream: {}", e))?;
   debug!("Opened QUIC stream for TCP peer {}", peer_addr);

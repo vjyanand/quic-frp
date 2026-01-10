@@ -164,6 +164,7 @@ fn load_certs(path: &PathBuf) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     .with_context(|| format!("Failed to parse certificates from {}", path.display()))
 }
 
+//Borrowed from https://github.com/compio-rs/compio/blob/ce3c0455027b055e6a8a4b5e9b8ee947f1b71746/compio-quic/src/builder.rs#L225
 mod verifier {
   use rustls::{
     client::danger::{ServerCertVerified, ServerCertVerifier},
