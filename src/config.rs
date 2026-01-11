@@ -12,6 +12,7 @@ pub struct ServiceDefinition {
   pub local_addr: String,
   pub name: String,
   pub remote_port: u16,
+  pub prefer_ipv6: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::debug;
 
+use crate::config::VERSION_MAJOR;
+
 #[derive(Debug)]
 pub enum TlsServerCertConfig {
   SelfSigned {
@@ -82,6 +84,13 @@ fn generate_self_signed(san: &[String]) -> anyhow::Result<(Vec<CertificateDer<'s
 
   debug!("generated self signed certificate");
   Ok((vec![cert_der], key_der))
+}
+
+pub fn alpn(token: &Option<String>) -> String {
+  match token {
+    Some(token) => format!("quic-proxy-{}-{}", VERSION_MAJOR, token.clone()),
+    None => format!("quic-proxy-{}", VERSION_MAJOR),
+  }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -164,6 +173,7 @@ fn load_certs(path: &PathBuf) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     .with_context(|| format!("Failed to parse certificates from {}", path.display()))
 }
 
+//Borrowed from https://github.com/compio-rs/compio/blob/ce3c0455027b055e6a8a4b5e9b8ee947f1b71746/compio-quic/src/builder.rs#L225
 mod verifier {
   use rustls::{
     client::danger::{ServerCertVerified, ServerCertVerifier},

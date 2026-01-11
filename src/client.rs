@@ -15,13 +15,14 @@ use quinn::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{io::copy, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::{
   backoff::ExponentialBackoff,
-  config::{Config, ServiceDefinition, VERSION_MAJOR},
+  config::{Config, ServiceDefinition},
   protocol::{ClientControlMessage, ServerAckMessage, read_frame, read_port_header, write_frame},
-  tls::TlsClientCertConfig,
+  tls::{self, TlsClientCertConfig},
 };
 
 type ServiceRegistry = Arc<DashMap<u16, ServiceDefinition>>;
@@ -33,11 +34,7 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
   let retry_secs = config.retry_interval.unwrap_or(5);
   let mut backoff = ExponentialBackoff::new(Duration::from_secs(retry_secs), Duration::from_secs(30));
 
-  let alpn = match &config.token {
-    Some(token) => format!("quic-proxy-{}-{}", VERSION_MAJOR, token.clone()),
-    None => format!("quic-proxy-{}", VERSION_MAJOR),
-  };
-
+  let alpn = tls::alpn(&config.token);
   let (server_addr, local_bind) = resolve_server_addr(&config)?;
 
   // Pre-allocate with expected capacity
@@ -47,29 +44,51 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
   }
   let services = Arc::new(services);
   let tls_config = config.tls;
+
+  let shutdown_token = CancellationToken::new();
+  tokio::spawn({
+    let shutdown_clone = shutdown_token.clone();
+    async move {
+      tokio::signal::ctrl_c().await.ok();
+      info!("CTRC-C received");
+      shutdown_clone.cancel();
+    }
+  });
+
   loop {
     match connect_to_server(server_addr, local_bind, &alpn, tls_config.clone()).await {
       Ok(conn) => {
         info!("Connected to server");
         backoff.reset();
-
-        match handle_connection(conn, &services, config_path).await {
-          Ok(LoopControl::Shutdown) => {
-            info!("Clean shutdown requested");
-            break;
+        tokio::select! {
+          result = handle_connection(conn, &services, config_path, shutdown_token.clone()) => {
+            match result {
+              Ok(LoopControl::Shutdown) => {
+                info!("Clean shutdown requested");
+                break;
+              }
+              Ok(LoopControl::Reconnect) => {
+                info!("Reconnecting...");
+              }
+              Err(e) => {
+                warn!("Connection error: {}", e);
+              }
+            }
           }
-          Ok(LoopControl::Reconnect) => {
-            info!("Reconnecting...");
-          }
-          Err(e) => {
-            warn!("Connection error: {}", e);
-          }
+        _ = shutdown_token.cancelled() => {break;}
         }
       }
       Err(e) => {
         let delay = backoff.next_delay();
-        warn!("Connection failed: {}, retrying in {}s", e, delay.as_secs());
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+          _ = tokio::time::sleep(delay) => {
+            warn!("Connection failed: {}, retrying in {}s", e, delay.as_secs());
+          }
+          _ = shutdown_token.cancelled() => {
+            info!("Shutdown during connection retry backoff");
+            break;
+          }
+        }
       }
     }
   }
@@ -132,7 +151,6 @@ async fn connect_to_server(
   tls: TlsClientCertConfig,
 ) -> anyhow::Result<Connection> {
   let mut client_crypto = tls.into_client_config()?;
-
   client_crypto.alpn_protocols = vec![alpn.into()];
 
   let quic_config = QuicClientConfig::try_from(client_crypto)?;
@@ -143,6 +161,7 @@ async fn connect_to_server(
 
   let endpoint = Endpoint::client(local_bind)?;
   debug!("End point created");
+
   let connection = endpoint.connect_with(client_config, server_addr, "localhost")?.await?;
   Ok(connection)
 }
@@ -155,6 +174,7 @@ async fn handle_connection(
   conn: Connection,
   services: &ServiceRegistry,
   config_path: &str,
+  shutdown_token: CancellationToken,
 ) -> anyhow::Result<LoopControl> {
   let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
   debug!("Control stream opened");
@@ -172,8 +192,15 @@ async fn handle_connection(
   let (reload_tx, reload_rx) = std::sync::mpsc::channel();
   let _watcher = setup_config_watcher(config_path, reload_tx)?;
 
-  let result =
-    event_loop_with_connection_monitor(&mut ctrl_send, services, config_path, reload_rx, quic_ctrl_task).await;
+  let result = event_loop_with_connection_monitor(
+    &mut ctrl_send,
+    services,
+    config_path,
+    reload_rx,
+    quic_ctrl_task,
+    shutdown_token,
+  )
+  .await;
 
   // Best-effort cleanup - batch unregister messages
   for svc in services.iter() {
@@ -193,9 +220,9 @@ async fn event_loop_with_connection_monitor(
   config_path: &str,
   reload_rx: std::sync::mpsc::Receiver<()>,
   quic_ctrl_task: JoinHandle<bool>,
+  shutdown_token: CancellationToken,
 ) -> anyhow::Result<LoopControl> {
   let mut conn_dead = pin!(quic_ctrl_task);
-  let poll_interval = Duration::from_millis(500);
 
   loop {
     // Drain all pending reload signals (coalesce rapid changes)
@@ -211,24 +238,16 @@ async fn event_loop_with_connection_monitor(
       }
     }
 
-    let ctrl_c_fut = pin!(tokio::signal::ctrl_c());
-    let sleep_fut = pin!(tokio::time::sleep(poll_interval));
-    let conn_check = pin!(async { (&mut conn_dead).await });
-
-    let ctrl_c_or_sleep = pin!(select(ctrl_c_fut, sleep_fut));
-
-    match select(conn_check, ctrl_c_or_sleep).await {
-      Either::Left(_) => {
+    tokio::select! {
+      _ = &mut conn_dead => {
         info!("Connection lost, will reconnect");
         return Ok(LoopControl::Reconnect);
       }
-      Either::Right((inner_result, _)) => {
-        if let Either::Left(_) = inner_result {
-          info!("Ctrl-C received, shutting down");
-          return Ok(LoopControl::Shutdown);
-        }
-        // Timeout - continue loop
+      _ = shutdown_token.cancelled() =>{
+        info!("Shutdown requested");
+        return Ok(LoopControl::Shutdown);
       }
+      _ = tokio::time::sleep(Duration::from_millis(500))=>{}
     }
   }
 }
