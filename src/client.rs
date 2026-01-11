@@ -45,13 +45,13 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
   let services = Arc::new(services);
   let tls_config = config.tls;
 
-  let shutdown_token = CancellationToken::new();
+  let shutdown = CancellationToken::new();
   tokio::spawn({
-    let shutdown_clone = shutdown_token.clone();
+    let shutdown = shutdown.clone();
     async move {
       tokio::signal::ctrl_c().await.ok();
-      info!("CTRC-C received");
-      shutdown_clone.cancel();
+      info!("Ctrl-C received");
+      shutdown.cancel();
     }
   });
 
@@ -61,7 +61,7 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
         info!("Connected to server");
         backoff.reset();
         tokio::select! {
-          result = handle_connection(conn, &services, config_path, shutdown_token.clone()) => {
+          result = handle_connection(conn, &services, config_path, shutdown.clone()) => {
             match result {
               Ok(LoopControl::Shutdown) => {
                 info!("Clean shutdown requested");
@@ -75,7 +75,7 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
               }
             }
           }
-        _ = shutdown_token.cancelled() => {break;}
+          _ = shutdown.cancelled() => break,
         }
       }
       Err(e) => {
@@ -84,8 +84,8 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
           _ = tokio::time::sleep(delay) => {
             warn!("Connection failed: {}, retrying in {}s", e, delay.as_secs());
           }
-          _ = shutdown_token.cancelled() => {
-            info!("Shutdown during connection retry backoff");
+          _ = shutdown.cancelled() => {
+            info!("Shutdown during retry backoff");
             break;
           }
         }
