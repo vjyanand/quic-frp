@@ -162,10 +162,6 @@ async fn connect_to_server(
   Ok(connection)
 }
 
-// =============================================================================
-// Connection Handler
-// =============================================================================
-
 async fn handle_connection(
   conn: Connection,
   services: &ServiceRegistry,
