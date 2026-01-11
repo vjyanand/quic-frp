@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
         .add_directive("quinn::connection=warn".parse().unwrap()),
     )
     .with_thread_names(true)
-    .with_span_events(FmtSpan::CLOSE | FmtSpan::ENTER)
+    .with_span_events(FmtSpan::CLOSE)
     .init();
 
   let cli = Cli::try_parse()?;
