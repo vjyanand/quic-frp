@@ -1,11 +1,5 @@
-use std::path::PathBuf;
-
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
-
-use crate::tls::TlsClientCertConfig;
-
-pub const VERSION_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
 
 #[derive(Debug, Clone, Encode, Decode, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct ServiceDefinition {
@@ -21,17 +15,11 @@ pub struct ClientConfig {
   pub remote_addr: String,
   pub retry_interval: Option<u64>,
   pub services: Vec<ServiceDefinition>,
-  pub token: Option<String>,
-  #[serde(default)]
-  pub tls: TlsClientCertConfig,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
-  pub cert: Option<PathBuf>,
-  pub key: Option<PathBuf>,
   pub listen_addr: String,
-  pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

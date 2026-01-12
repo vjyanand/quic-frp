@@ -1,20 +1,15 @@
-use std::{
-  collections::HashSet,
-  net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
-  pin::pin,
-  sync::Arc,
-  time::Duration,
-};
+use std::{collections::HashSet, net::ToSocketAddrs, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
 use futures::future::{Either, select};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-use quinn::{
-  Connection, Endpoint, IdleTimeout, RecvStream, SendStream, TransportConfig, VarInt, congestion,
-  crypto::rustls::QuicClientConfig,
-};
+use smux::{Session, Stream};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{io::copy, task::JoinHandle};
+use tokio::{
+  io::{AsyncWriteExt, WriteHalf, copy, split},
+  task::JoinHandle,
+};
+use tokio_kcp::{KcpConfig, KcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
@@ -22,7 +17,6 @@ use crate::{
   backoff::ExponentialBackoff,
   config::{Config, ServiceDefinition},
   protocol::{ClientControlMessage, ServerAckMessage, read_frame, read_port_header, write_frame},
-  tls::{self, TlsClientCertConfig},
 };
 
 type ServiceRegistry = Arc<DashMap<u16, ServiceDefinition>>;
@@ -34,16 +28,12 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
   let retry_secs = config.retry_interval.unwrap_or(5);
   let mut backoff = ExponentialBackoff::new(Duration::from_secs(retry_secs), Duration::from_secs(30));
 
-  let alpn = tls::alpn(&config.token);
-  let (server_addr, local_bind) = resolve_server_addr(&config)?;
-
   // Pre-allocate with expected capacity
   let services = DashMap::with_capacity(config.services.len());
   for svc in config.services {
     services.insert(svc.remote_port, svc);
   }
   let services = Arc::new(services);
-  let tls_config = config.tls;
 
   let shutdown = CancellationToken::new();
   tokio::spawn({
@@ -56,7 +46,7 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
   });
 
   loop {
-    match connect_to_server(server_addr, local_bind, &alpn, tls_config.clone()).await {
+    match connect_to_server(&config.remote_addr, config.prefer_ipv6.unwrap_or_default()).await {
       Ok(conn) => {
         info!("Connected to server");
         backoff.reset();
@@ -97,95 +87,48 @@ enum LoopControl {
   Reconnect,
 }
 
-// =============================================================================
-// QUIC Connection Setup
-// =============================================================================
-
-#[inline]
-fn resolve_server_addr(config: &crate::config::ClientConfig) -> anyhow::Result<(SocketAddr, SocketAddr)> {
-  let prefer_v6 = config.prefer_ipv6.unwrap_or(false);
-  let addrs: Vec<_> = config.remote_addr.to_socket_addrs()?.collect();
-
+async fn connect_to_server(remote_addr: &str, prefer_v6: bool) -> anyhow::Result<KcpStream> {
+  let kcp_config = KcpConfig::default();
+  let addrs: Vec<_> = remote_addr.to_socket_addrs()?.collect();
   let chosen = addrs
     .iter()
     .find(|a| if prefer_v6 { a.is_ipv6() } else { a.is_ipv4() })
     .or_else(|| addrs.first())
     .copied()
-    .ok_or_else(|| anyhow::anyhow!("No address found for {}", config.remote_addr))?;
-
-  let local_bind = SocketAddr::new(
-    if chosen.is_ipv6() { IpAddr::V6(Ipv6Addr::UNSPECIFIED) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) },
-    0,
-  );
-
-  debug!("Resolved server: {}, local bind: {}", chosen, local_bind);
-  Ok((chosen, local_bind))
-}
-
-fn create_transport_config() -> anyhow::Result<TransportConfig> {
-  let mut transport = TransportConfig::default();
-
-  transport.keep_alive_interval(Some(Duration::from_secs(5)));
-  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10))?));
-  transport.max_concurrent_bidi_streams(VarInt::from_u64(100)?); // Increased from 10
-  transport.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
-  // Flow control tuning for better throughput
-  transport.send_window(4 * 1024 * 1024); // 4MB send window
-  transport.stream_receive_window(VarInt::from_u64(1024 * 1024)?); // 1MB per stream
-  transport.receive_window(VarInt::from_u64(8 * 1024 * 1024)?); // 8MB total
-
-  // Initial RTT estimate (can help with initial congestion window)
-  transport.initial_rtt(Duration::from_millis(100));
-
-  Ok(transport)
-}
-
-async fn connect_to_server(
-  server_addr: SocketAddr,
-  local_bind: SocketAddr,
-  alpn: &str,
-  tls: TlsClientCertConfig,
-) -> anyhow::Result<Connection> {
-  let mut client_crypto = tls.into_client_config()?;
-  client_crypto.alpn_protocols = vec![alpn.into()];
-
-  let quic_config = QuicClientConfig::try_from(client_crypto)?;
-  let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
-
-  let transport_config = Arc::new(create_transport_config()?);
-  client_config.transport_config(transport_config);
-
-  let endpoint = Endpoint::client(local_bind)?;
-  debug!("End point created");
-
-  let connection = endpoint.connect_with(client_config, server_addr, "localhost")?.await?;
-  Ok(connection)
+    .ok_or_else(|| anyhow::anyhow!("No address found for {}", remote_addr))?;
+  let kcp_stream = KcpStream::connect(&kcp_config, chosen).await?;
+  debug!("Connected to {}", chosen);
+  Ok(kcp_stream)
 }
 
 async fn handle_connection(
-  conn: Connection,
+  kcp_stream: KcpStream,
   services: &ServiceRegistry,
   config_path: &str,
   shutdown_token: CancellationToken,
 ) -> anyhow::Result<LoopControl> {
-  let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
+  let smux_session = Session::client(kcp_stream, smux::Config::default()).await?;
+  let (mut smux_stream_r, mut smux_stream_w) = split(smux_session.open_stream().await?);
+
   debug!("Control stream opened");
 
-  register_services(&mut ctrl_send, services).await?;
+  register_services(&mut smux_stream_w, services).await?;
 
   let services_ref = Arc::clone(services);
-  let accept_task = tokio::spawn(async move { accept_data_streams(conn, services_ref).await });
+  let accept_task = tokio::spawn(async move { accept_data_streams(smux_session, services_ref).await });
 
-  let quic_ctrl_task = tokio::spawn(async move {
-    receive_control_messages(&mut ctrl_recv).await;
-    true
+  let quic_ctrl_task = tokio::spawn({
+    async move {
+      receive_control_messages(&mut smux_stream_r).await;
+      true
+    }
   });
 
   let (reload_tx, reload_rx) = std::sync::mpsc::channel();
   let _watcher = setup_config_watcher(config_path, reload_tx)?;
 
   let result = event_loop_with_connection_monitor(
-    &mut ctrl_send,
+    &mut smux_stream_w,
     services,
     config_path,
     reload_rx,
@@ -194,27 +137,29 @@ async fn handle_connection(
   )
   .await;
 
+  debug!("Closing conn");
+
   // Best-effort cleanup - batch unregister messages
   for svc in services.iter() {
     let svc = svc.clone();
-    let _ = write_frame(&mut ctrl_send, &ClientControlMessage::DeregisterService(svc)).await;
+    let _ = write_frame(&mut smux_stream_w, &ClientControlMessage::DeregisterService(svc)).await;
   }
-  let _ = ctrl_send.finish();
-
+  debug!("Closing conn");
+  let _ = smux_stream_w.shutdown().await;
   accept_task.abort();
 
   result
 }
 
 async fn event_loop_with_connection_monitor(
-  ctrl_send: &mut SendStream,
+  smux_stream_w: &mut WriteHalf<Stream>,
   services: &ServiceRegistry,
   config_path: &str,
   reload_rx: std::sync::mpsc::Receiver<()>,
   quic_ctrl_task: JoinHandle<bool>,
   shutdown_token: CancellationToken,
 ) -> anyhow::Result<LoopControl> {
-  let mut conn_dead = pin!(quic_ctrl_task);
+  let mut conn_dead = std::pin::pin!(quic_ctrl_task);
 
   loop {
     // Drain all pending reload signals (coalesce rapid changes)
@@ -225,7 +170,8 @@ async fn event_loop_with_connection_monitor(
 
     if reload_pending {
       info!("Config file changed, reloading...");
-      if let Err(e) = handle_config_reload(ctrl_send, services, config_path).await {
+
+      if let Err(e) = handle_config_reload(smux_stream_w, services, config_path).await {
         warn!("Config reload failed: {}", e);
       }
     }
@@ -265,7 +211,7 @@ fn setup_config_watcher(config_path: &str, tx: std::sync::mpsc::Sender<()>) -> a
 }
 
 async fn handle_config_reload(
-  ctrl_send: &mut SendStream,
+  smux_stream_w: &mut WriteHalf<Stream>,
   services: &ServiceRegistry,
   config_path: &str,
 ) -> anyhow::Result<()> {
@@ -282,7 +228,7 @@ async fn handle_config_reload(
   for port in to_remove {
     if let Some(svc) = services.remove(&port) {
       info!("Unregistering removed service: {}", svc.1.name);
-      write_frame(ctrl_send, &ClientControlMessage::DeregisterService(svc.1)).await?;
+      write_frame(smux_stream_w, &ClientControlMessage::DeregisterService(svc.1)).await?;
     }
   }
 
@@ -290,7 +236,7 @@ async fn handle_config_reload(
   for svc in new_config.services {
     if !current_ports.contains(&svc.remote_port) {
       info!("Registering new service: {}", svc.name);
-      write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone())).await?;
+      write_frame(smux_stream_w, &ClientControlMessage::RegisterService(svc.clone())).await?;
       services.insert(svc.remote_port, svc);
     } else if let Some(mut entry) = services.get_mut(&svc.remote_port) {
       // Update existing service if local_addr changed
@@ -305,10 +251,10 @@ async fn handle_config_reload(
   Ok(())
 }
 
-async fn register_services(ctrl_send: &mut SendStream, services: &ServiceRegistry) -> anyhow::Result<()> {
+async fn register_services(smux_stream_w: &mut WriteHalf<Stream>, services: &ServiceRegistry) -> anyhow::Result<()> {
   for svc in services.iter() {
     let msg = ClientControlMessage::RegisterService(svc.clone());
-    if let Err(e) = write_frame(ctrl_send, &msg).await {
+    if let Err(e) = write_frame(smux_stream_w, &msg).await {
       warn!("Failed to register {}: {}", svc.name, e);
     } else {
       debug!("Sent register for {}", svc.name);
@@ -317,9 +263,9 @@ async fn register_services(ctrl_send: &mut SendStream, services: &ServiceRegistr
   Ok(())
 }
 
-async fn receive_control_messages(ctrl_recv: &mut RecvStream) {
+async fn receive_control_messages(arc_smux_stream: &mut tokio::io::ReadHalf<smux::Stream>) {
   loop {
-    match read_frame::<ServerAckMessage, _>(ctrl_recv).await {
+    match read_frame::<ServerAckMessage, _>(arc_smux_stream).await {
       Ok(msg) => match msg {
         ServerAckMessage::ServiceRegistered { service_name, success, error } => {
           if success {
@@ -346,25 +292,21 @@ async fn receive_control_messages(ctrl_recv: &mut RecvStream) {
 // Data Stream Handling
 // =============================================================================
 
-async fn accept_data_streams(conn: Connection, services: ServiceRegistry) {
+async fn accept_data_streams(smux_session: Session, services: ServiceRegistry) {
   loop {
-    match conn.accept_bi().await {
-      Ok((mut quic_send, mut quic_recv)) => {
+    match smux_session.accept_stream().await {
+      Ok(mut smux_stream) => {
         debug!("Accepted data stream from server");
         let services_clone = Arc::clone(&services);
 
         tokio::spawn(async move {
-          match handle_data_stream(&mut quic_send, &mut quic_recv, &services_clone).await {
+          match handle_data_stream(&mut smux_stream, &services_clone).await {
             Ok(()) => {}
             Err(e) => {
               debug!("Data stream error: {}", e);
               // Best-effort cleanup
-              let code = VarInt::from_u32(1);
-              if quic_send.reset(code).is_ok() {
+              if smux_stream.close().await.is_ok() {
                 trace!("Send stream reset");
-              }
-              if quic_recv.stop(code).is_ok() {
-                trace!("Receive stream stopped");
               }
             }
           }
@@ -378,12 +320,8 @@ async fn accept_data_streams(conn: Connection, services: ServiceRegistry) {
   }
 }
 
-async fn handle_data_stream(
-  quic_send: &mut SendStream,
-  quic_recv: &mut RecvStream,
-  services: &ServiceRegistry,
-) -> anyhow::Result<()> {
-  let port = read_port_header(quic_recv).await?;
+async fn handle_data_stream(smux_stream: &mut Stream, services: &ServiceRegistry) -> anyhow::Result<()> {
+  let port = read_port_header(smux_stream).await?;
 
   // Direct lookup by port instead of iteration
   let service = services.get(&port).ok_or_else(|| anyhow::anyhow!("No service configured for port {}", port))?;
@@ -409,27 +347,27 @@ async fn handle_data_stream(
   let local_tcp: tokio::net::TcpStream = tokio::net::TcpStream::from_std(std_tcp)?;
   debug!("Connected to local service: {}", local_addr);
 
-  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv).await;
+  proxy_quic_to_tcp(local_tcp, smux_stream).await;
   Ok(())
 }
 
-async fn proxy_quic_to_tcp(mut tcp: tokio::net::TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
+async fn proxy_quic_to_tcp(mut tcp: tokio::net::TcpStream, smux_stream: &mut Stream) {
   let (mut tcp_r, mut tcp_w) = tcp.split();
-
+  let (mut smux_stream_r, mut smux_stream_s) = split(smux_stream);
   let upstream = async {
-    let result = copy(&mut tcp_r, quic_send).await;
-    let _ = quic_send.finish();
+    let result = copy(&mut tcp_r, &mut smux_stream_s).await;
+    let _ = smux_stream_s.shutdown().await;
     result
   };
 
   let downstream = async {
-    let res = copy(quic_recv, &mut tcp_w).await;
+    let res = copy(&mut smux_stream_r, &mut tcp_w).await;
     trace!("Server side closed (external client disconnected)");
     res
   };
 
-  let upstream = pin!(upstream);
-  let downstream = pin!(downstream);
+  let upstream = std::pin::pin!(upstream);
+  let downstream = std::pin::pin!(downstream);
 
   match select(upstream, downstream).await {
     Either::Left((res, _)) => {

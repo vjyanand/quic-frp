@@ -45,7 +45,12 @@ pub async fn write_frame<T: bitcode::Encode, W: AsyncWrite + Unpin>(writer: &mut
 
 /// Read a 2-byte port header from incoming data stream
 pub async fn read_port_header<R: AsyncRead + Unpin>(reader: &mut R) -> anyhow::Result<u16> {
-  let mut buf = [0u8; 2];
-  reader.read_exact(&mut buf[..]).await?;
-  Ok(u16::from_be_bytes(buf))
+  let result = reader.read_u16().await?;
+  Ok(result)
+}
+
+/// Read a 2-byte port header from incoming data stream
+pub async fn write_port_header<R: AsyncWrite + Unpin>(writer: &mut R, port: u16) -> anyhow::Result<()> {
+  writer.write_u16(port).await?;
+  Ok(())
 }

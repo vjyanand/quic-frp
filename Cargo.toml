@@ -10,12 +10,8 @@ clap = { version = "4.5.54", features = ["derive"] }
 dashmap = "6.1.0"
 futures = "0.3.31"
 notify = "8.2.0"
-quinn = "0.11.9"
-rcgen = "0.14.6"
-rustls = { version = "0.23.36", default-features = false, features = ["ring"] }
-rustls-native-certs = "0.8.3"
-rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["serde_derive"] }
+smux = "0.2.0"
 socket2 = "0.6.1"
 tokio = { version = "1.49", default-features = false, features = [
   "macros",
@@ -24,6 +20,7 @@ tokio = { version = "1.49", default-features = false, features = [
   "signal",
 ] }
 tokio-util = "0.7.18"
+tokio_kcp = "0.9.8"
 toml = "0.9.10"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", default-features = false, features = [
@@ -32,8 +29,6 @@ tracing-subscriber = { version = "0.3.22", default-features = false, features = 
 ] }
 uuid = { version = "1.19.0", features = ["v4"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.180"
 
 [profile.release]
 opt-level = "z"

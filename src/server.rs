@@ -1,82 +1,62 @@
-use crate::protocol::{ServerAckMessage, write_frame};
-use crate::tls;
+use crate::protocol::{ServerAckMessage, write_frame, write_port_header};
 use crate::{
   config::ServiceDefinition,
   protocol::{ClientControlMessage, read_frame},
-  tls::TlsServerCertConfig,
 };
 use dashmap::DashMap;
 use futures::future::{Either, select};
-use quinn::{
-  Connection, Endpoint, EndpointConfig, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
-  crypto::rustls::QuicServerConfig, default_runtime,
-};
+use smux::Session;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::io::copy;
+use tokio::io::{AsyncWriteExt, copy, split};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use tokio_kcp::{KcpConfig, KcpListener, KcpStream};
 use tracing::{debug, info, trace, warn};
 
 type PortRegistry = Arc<DashMap<u16, PortBinding>>;
 
 pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<()> {
   info!("server starting on {}", config.listen_addr);
+  let kcp_config = KcpConfig::default();
 
-  let mut server_crypto = match (config.cert, config.key) {
-    (Some(cert), Some(key)) => TlsServerCertConfig::from_pem_files(cert, key).into_server_config()?,
-    _ => TlsServerCertConfig::self_signed(vec!["localhost"]).into_server_config()?,
-  };
-
-  let alpn = tls::alpn(&config.token);
-  server_crypto.alpn_protocols = vec![alpn.into()];
-  let server_crypto = Arc::new(QuicServerConfig::try_from(server_crypto)?);
-
-  let mut server_config = ServerConfig::with_crypto(server_crypto);
-  server_config.transport_config(create_transport_config()?);
-
-  let bind_addr: SocketAddr = config.listen_addr.parse()?;
-  let socket = create_udp_socket(bind_addr)?;
-  let endpoint_config = EndpointConfig::default();
-  let runtime = default_runtime().unwrap();
-  let endpoint = Endpoint::new(endpoint_config, Some(server_config), socket, runtime)?;
-
-  info!("server listening on {}", endpoint.local_addr()?);
+  let mut listener = KcpListener::bind(kcp_config, &config.listen_addr).await?;
+  info!("server listening on {}", listener.local_addr()?);
 
   let registry: PortRegistry = Arc::new(DashMap::with_capacity(10));
 
   loop {
-    let Some(incoming) = endpoint.accept().await else {
+    let Ok((kcp_stream, socket_addr)) = listener.accept().await else {
       warn!("endpoint closed, shutting down");
       continue;
     };
 
     let registry = Arc::clone(&registry);
     tokio::spawn(async move {
-      let result = handle_connection(incoming, registry).await;
+      let result = handle_connection(kcp_stream, socket_addr, registry).await;
       debug!("result: {:?}", result);
     });
   }
 }
 
-async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) -> anyhow::Result<()> {
-  let connection = incoming.await?;
-  let remote_address = connection.remote_address();
-  debug!("new incoming connection from {} with id {}", remote_address, connection.stable_id());
-
-  let client_identity = ClientIdentity::from(remote_address);
+async fn handle_connection(
+  kcp_stream: KcpStream,
+  socket_addr: SocketAddr,
+  registry: PortRegistry,
+) -> anyhow::Result<()> {
+  let client_identity = ClientIdentity::from(socket_addr);
   trace!("new client with identity {}", client_identity);
-
-  let (mut control_send, mut control_recv) = connection.accept_bi().await?; // Control Stream from client
+  let smux_session = Session::server(kcp_stream, smux::Config::default()).await?;
+  let mut smux_stream = smux_session.accept_stream().await?; // Control Stream from client
   debug!("Control stream established for {}", client_identity);
 
   loop {
-    match read_frame::<ClientControlMessage, _>(&mut control_recv).await {
+    match read_frame::<ClientControlMessage, _>(&mut smux_stream).await {
       Ok(ClientControlMessage::RegisterService(def)) => {
-        handle_register_service(def, &connection, &mut control_send, &client_identity, &registry).await?;
+        handle_register_service(smux_session.clone(), def, &mut smux_stream, &client_identity, &registry).await?;
       }
       Ok(ClientControlMessage::DeregisterService(def)) => {
-        if let Err(e) = handle_unregister_service(def, &mut control_send, &client_identity, &registry).await {
+        if let Err(e) = handle_unregister_service(def, &mut smux_stream, &client_identity, &registry).await {
           warn!("handle_unregister_service error: {:?}", e);
         }
       }
@@ -92,9 +72,9 @@ async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) ->
 }
 
 async fn handle_register_service(
+  smux_session: Session,
   def: ServiceDefinition,
-  conn: &Connection,
-  control_send: &mut SendStream,
+  control_send: &mut smux::Stream,
   client_identity: &ClientIdentity,
   registry: &PortRegistry,
 ) -> anyhow::Result<()> {
@@ -116,10 +96,9 @@ async fn handle_register_service(
   let ack = ServerAckMessage::ServiceRegistered { service_name: service_name.clone(), success: true, error: None };
   write_frame(control_send, &ack).await?;
 
-  let conn_clone = conn.clone();
   let def_clone = def.clone();
   let runtime_handle = tokio::spawn(async move {
-    accept_tcp_connections(&conn_clone, tcp_listener, &def_clone).await;
+    accept_tcp_connections(smux_session, tcp_listener, &def_clone).await;
   });
 
   let port_binding = PortBinding {
@@ -229,7 +208,7 @@ async fn create_tcp_listener_with_retry(service: &ServiceDefinition, max_retries
   Err(anyhow::anyhow!("Failed to bind {} after {} attempts: {}", bind_addr, max_retries + 1, last_error.unwrap()))
 }
 
-async fn accept_tcp_connections(conn: &Connection, listener: TcpListener, service: &ServiceDefinition) {
+async fn accept_tcp_connections(smux_session: Session, listener: TcpListener, service: &ServiceDefinition) {
   let port = service.remote_port;
   info!("Accepting TCP connections on port {} for service '{}'", port, service.name);
 
@@ -237,10 +216,13 @@ async fn accept_tcp_connections(conn: &Connection, listener: TcpListener, servic
     match listener.accept().await {
       Ok((tcp_stream, peer_addr)) => {
         debug!("Accepted TCP connection on port {} from {}", port, peer_addr);
-        let conn_clone = conn.clone();
-        tokio::spawn(async move {
-          if let Err(e) = handle_tcp_connection(conn_clone, tcp_stream, port, peer_addr).await {
-            warn!("TCP connection handler error for {}: {}", peer_addr, e);
+
+        tokio::spawn({
+          let smux_session = smux_session.clone();
+          async move {
+            if let Err(e) = handle_tcp_connection(smux_session, tcp_stream, port, peer_addr).await {
+              warn!("TCP connection handler error for {}: {}", peer_addr, e);
+            }
           }
         });
       }
@@ -253,38 +235,35 @@ async fn accept_tcp_connections(conn: &Connection, listener: TcpListener, servic
 }
 
 async fn handle_tcp_connection(
-  conn: Connection,
+  smux_session: Session,
   tcp_stream: TcpStream,
   port: u16,
   peer_addr: SocketAddr,
 ) -> anyhow::Result<()> {
   debug!("Opening QUIC stream for TCP peer {}", peer_addr);
-  let (mut quic_send, mut quic_recv) =
-    conn.open_bi().await.map_err(|e| anyhow::anyhow!("Failed to open QUIC stream: {}", e))?;
+  let mut smux_stream =
+    smux_session.open_stream().await.map_err(|e| anyhow::anyhow!("Failed to open QUIC stream: {}", e))?;
   debug!("Opened QUIC stream for TCP peer {}", peer_addr);
 
   // Write port header
-  quic_send.write_all(&port.to_be_bytes()).await.map_err(|e| anyhow::anyhow!("Failed to write port header: {}", e))?;
+  write_port_header(&mut smux_stream, port).await.map_err(|e| anyhow::anyhow!("Failed to write port header: {}", e))?;
 
-  proxy_tcp_to_quic(tcp_stream, &mut quic_send, &mut quic_recv).await?;
+  proxy_tcp_to_quic(tcp_stream, &mut smux_stream).await?;
   debug!("TCP connection {} closed", peer_addr);
   Ok(())
 }
 
-async fn proxy_tcp_to_quic(
-  mut tcp: TcpStream,
-  quic_send: &mut SendStream,
-  quic_recv: &mut RecvStream,
-) -> anyhow::Result<()> {
+async fn proxy_tcp_to_quic(mut tcp: TcpStream, smux_stream: &mut smux::Stream) -> anyhow::Result<()> {
   let (mut tcp_r, mut tcp_w) = tcp.split();
+  let (mut smux_stream_r, mut smux_stream_w) = split(smux_stream);
 
   let upstream = async {
-    let result = copy(&mut tcp_r, quic_send).await;
-    let _ = quic_send.finish(); // Ignore finish errors
+    let result = copy(&mut tcp_r, &mut smux_stream_w).await;
+    let _ = smux_stream_w.shutdown().await; // Ignore finish errors
     result
   };
 
-  let downstream = async { copy(quic_recv, &mut tcp_w).await };
+  let downstream = async { copy(&mut smux_stream_r, &mut tcp_w).await };
 
   let upstream = std::pin::pin!(upstream);
   let downstream = std::pin::pin!(downstream);
@@ -307,7 +286,7 @@ async fn proxy_tcp_to_quic(
 
 async fn handle_unregister_service(
   def: ServiceDefinition,
-  control_send: &mut SendStream,
+  control_send: &mut smux::Stream,
   client_identity: &ClientIdentity,
   registry: &PortRegistry,
 ) -> anyhow::Result<()> {
@@ -355,85 +334,6 @@ fn remove_port(port: u16, registry: &PortRegistry, client: &ClientIdentity) -> b
     debug!("Port {} was taken over, skipping cleanup", port);
   }
   false
-}
-
-// ──────────────────────────────────────────────────────────────
-// Configuration helpers
-// ──────────────────────────────────────────────────────────────
-fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
-  let mut transport = TransportConfig::default();
-  transport.keep_alive_interval(Some(Duration::from_secs(5)));
-  transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(20))?));
-  transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
-  transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-  Ok(Arc::new(transport))
-}
-
-fn create_udp_socket(bind_addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
-  let socket = Socket::new(Domain::for_address(bind_addr), Type::DGRAM, Some(Protocol::UDP))?;
-  socket.set_nonblocking(true)?;
-  socket.set_keepalive(true)?;
-
-  #[cfg(target_os = "linux")]
-  configure_linux_socket(&socket);
-
-  socket.bind(&bind_addr.into())?;
-  Ok(socket.into())
-}
-
-#[cfg(target_os = "linux")]
-fn configure_linux_socket(socket: &Socket) {
-  use std::os::fd::AsRawFd;
-  const UDP_GRO: libc::c_int = 104;
-  const UDP_SEGMENT: libc::c_int = 103; // GSO for send offload
-
-  let fd = socket.as_raw_fd();
-  let enable: libc::c_int = 1;
-
-  // Enable UDP GRO (receive offload)
-  let result = unsafe {
-    libc::setsockopt(
-      fd,
-      libc::SOL_UDP,
-      UDP_GRO,
-      &enable as *const _ as *const libc::c_void,
-      std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-    )
-  };
-  if result == 0 {
-    debug!("UDP_GRO enabled");
-  } else {
-    debug!("UDP_GRO not available: {}", std::io::Error::last_os_error());
-  }
-
-  // Enable UDP GSO (send offload)
-  let segment_size: u16 = 1472; // Typical MTU - headers
-  let result = unsafe {
-    libc::setsockopt(
-      fd,
-      libc::SOL_UDP,
-      UDP_SEGMENT,
-      &segment_size as *const _ as *const libc::c_void,
-      std::mem::size_of::<u16>() as libc::socklen_t,
-    )
-  };
-  if result == 0 {
-    debug!("UDP_GSO enabled with segment size {}", segment_size);
-  } else {
-    debug!("UDP_GSO not available: {}", std::io::Error::last_os_error());
-  }
-
-  // Set IP_TOS for lower latency (DSCP EF)
-  let tos: libc::c_int = 0xB8; // DSCP EF
-  let _ = unsafe {
-    libc::setsockopt(
-      fd,
-      libc::IPPROTO_IP,
-      libc::IP_TOS,
-      &tos as *const _ as *const libc::c_void,
-      std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-    )
-  };
 }
 
 struct PortBinding {

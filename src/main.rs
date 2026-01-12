@@ -4,7 +4,6 @@ mod client;
 mod config;
 mod protocol;
 mod server;
-mod tls;
 
 use clap::Parser;
 use tracing::debug;
