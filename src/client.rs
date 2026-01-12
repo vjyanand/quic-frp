@@ -9,7 +9,7 @@ use tokio::{
   io::{AsyncWriteExt, WriteHalf, copy, split},
   task::JoinHandle,
 };
-use tokio_kcp::{KcpConfig, KcpStream};
+use tokio_kcp::{KcpConfig, KcpNoDelayConfig, KcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
@@ -88,7 +88,8 @@ enum LoopControl {
 }
 
 async fn connect_to_server(remote_addr: &str, prefer_v6: bool) -> anyhow::Result<KcpStream> {
-  let kcp_config = KcpConfig::default();
+  let mut kcp_config = KcpConfig::default();
+  kcp_config.nodelay = KcpNoDelayConfig::normal();
   let addrs: Vec<_> = remote_addr.to_socket_addrs()?.collect();
   let chosen = addrs
     .iter()

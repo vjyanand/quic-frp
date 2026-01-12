@@ -11,14 +11,15 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncWriteExt, copy, split};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use tokio_kcp::{KcpConfig, KcpListener, KcpStream};
+use tokio_kcp::{KcpConfig, KcpListener, KcpNoDelayConfig, KcpStream};
 use tracing::{debug, info, trace, warn};
 
 type PortRegistry = Arc<DashMap<u16, PortBinding>>;
 
 pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<()> {
   info!("server starting on {}", config.listen_addr);
-  let kcp_config = KcpConfig::default();
+  let mut kcp_config = KcpConfig::default();
+  kcp_config.nodelay = KcpNoDelayConfig::normal();
 
   let mut listener = KcpListener::bind(kcp_config, &config.listen_addr).await?;
   info!("server listening on {}", listener.local_addr()?);
