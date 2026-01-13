@@ -45,13 +45,13 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
   let services = Arc::new(services);
   let tls_config = config.tls;
 
-  let shutdown_token = CancellationToken::new();
+  let shutdown = CancellationToken::new();
   tokio::spawn({
-    let shutdown_clone = shutdown_token.clone();
+    let shutdown = shutdown.clone();
     async move {
       tokio::signal::ctrl_c().await.ok();
-      info!("CTRC-C received");
-      shutdown_clone.cancel();
+      info!("Ctrl-C received");
+      shutdown.cancel();
     }
   });
 
@@ -60,22 +60,18 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
       Ok(conn) => {
         info!("Connected to server");
         backoff.reset();
-        tokio::select! {
-          result = handle_connection(conn, &services, config_path, shutdown_token.clone()) => {
-            match result {
-              Ok(LoopControl::Shutdown) => {
-                info!("Clean shutdown requested");
-                break;
-              }
-              Ok(LoopControl::Reconnect) => {
-                info!("Reconnecting...");
-              }
-              Err(e) => {
-                warn!("Connection error: {}", e);
-              }
-            }
+
+        match handle_connection(conn, &services, config_path, shutdown.clone()).await {
+          Ok(LoopControl::Shutdown) => {
+            info!("Clean shutdown requested");
+            break;
           }
-        _ = shutdown_token.cancelled() => {break;}
+          Ok(LoopControl::Reconnect) => {
+            info!("Reconnecting...");
+          }
+          Err(e) => {
+            warn!("Connection error: {}", e);
+          }
         }
       }
       Err(e) => {
@@ -84,8 +80,8 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
           _ = tokio::time::sleep(delay) => {
             warn!("Connection failed: {}, retrying in {}s", e, delay.as_secs());
           }
-          _ = shutdown_token.cancelled() => {
-            info!("Shutdown during connection retry backoff");
+          _ = shutdown.cancelled() => {
+            info!("Shutdown during retry backoff");
             break;
           }
         }
@@ -126,7 +122,7 @@ fn resolve_server_addr(config: &crate::config::ClientConfig) -> anyhow::Result<(
   Ok((chosen, local_bind))
 }
 
-fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
+fn create_transport_config() -> anyhow::Result<TransportConfig> {
   let mut transport = TransportConfig::default();
 
   transport.keep_alive_interval(Some(Duration::from_secs(5)));
@@ -141,7 +137,7 @@ fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
   // Initial RTT estimate (can help with initial congestion window)
   transport.initial_rtt(Duration::from_millis(100));
 
-  Ok(Arc::new(transport))
+  Ok(transport)
 }
 
 async fn connect_to_server(
@@ -156,7 +152,7 @@ async fn connect_to_server(
   let quic_config = QuicClientConfig::try_from(client_crypto)?;
   let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
 
-  let transport_config = create_transport_config()?;
+  let transport_config = Arc::new(create_transport_config()?);
   client_config.transport_config(transport_config);
 
   let endpoint = Endpoint::client(local_bind)?;
@@ -165,10 +161,6 @@ async fn connect_to_server(
   let connection = endpoint.connect_with(client_config, server_addr, "localhost")?.await?;
   Ok(connection)
 }
-
-// =============================================================================
-// Connection Handler
-// =============================================================================
 
 async fn handle_connection(
   conn: Connection,
