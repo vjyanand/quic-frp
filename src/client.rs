@@ -29,7 +29,7 @@ type ServiceRegistry = Arc<DashMap<u16, ServiceDefinition>>;
 
 /// Client entry point
 pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) -> anyhow::Result<()> {
-  info!("Client connecting to {}", config.remote_addr);
+  info!("client connecting to {}", config.remote_addr);
 
   let retry_secs = config.retry_interval.unwrap_or(5);
   let mut backoff = ExponentialBackoff::new(Duration::from_secs(retry_secs), Duration::from_secs(30));
@@ -58,19 +58,19 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
   loop {
     match connect_to_server(server_addr, local_bind, &alpn, tls_config.clone()).await {
       Ok(conn) => {
-        info!("Connected to server");
+        info!("connected to server");
         backoff.reset();
 
         match handle_connection(conn, &services, config_path, shutdown.clone()).await {
           Ok(LoopControl::Shutdown) => {
-            info!("Clean shutdown requested");
+            info!("clean shutdown requested");
             break;
           }
           Ok(LoopControl::Reconnect) => {
-            info!("Reconnecting...");
+            info!("reconnecting...");
           }
           Err(e) => {
-            warn!("Connection error: {}", e);
+            warn!("connection error: {}", e);
           }
         }
       }
@@ -78,10 +78,10 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
         let delay = backoff.next_delay();
         tokio::select! {
           _ = tokio::time::sleep(delay) => {
-            warn!("Connection failed: {}, retrying in {}s", e, delay.as_secs());
+            warn!("connection failed: {}, retrying in {}s", e, delay.as_secs());
           }
           _ = shutdown.cancelled() => {
-            info!("Shutdown during retry backoff");
+            info!("shutdown during retry backoff");
             break;
           }
         }
@@ -118,7 +118,7 @@ fn resolve_server_addr(config: &crate::config::ClientConfig) -> anyhow::Result<(
     0,
   );
 
-  debug!("Resolved server: {}, local bind: {}", chosen, local_bind);
+  debug!("resolved server: {}, local bind: {}", chosen, local_bind);
   Ok((chosen, local_bind))
 }
 
@@ -156,7 +156,7 @@ async fn connect_to_server(
   client_config.transport_config(transport_config);
 
   let endpoint = Endpoint::client(local_bind)?;
-  debug!("End point created");
+  debug!("end point created");
 
   let connection = endpoint.connect_with(client_config, server_addr, "localhost")?.await?;
   Ok(connection)
@@ -169,7 +169,7 @@ async fn handle_connection(
   shutdown_token: CancellationToken,
 ) -> anyhow::Result<LoopControl> {
   let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
-  debug!("Control stream opened");
+  debug!("control stream opened");
 
   register_services(&mut ctrl_send, services).await?;
 
@@ -224,19 +224,19 @@ async fn event_loop_with_connection_monitor(
     }
 
     if reload_pending {
-      info!("Config file changed, reloading...");
+      info!("config file changed, reloading...");
       if let Err(e) = handle_config_reload(ctrl_send, services, config_path).await {
-        warn!("Config reload failed: {}", e);
+        warn!("config reload failed: {}", e);
       }
     }
 
     tokio::select! {
       _ = &mut conn_dead => {
-        info!("Connection lost, will reconnect");
+        info!("connection lost, will reconnect");
         return Ok(LoopControl::Reconnect);
       }
       _ = shutdown_token.cancelled() =>{
-        info!("Shutdown requested");
+        info!("shutdown requested");
         return Ok(LoopControl::Shutdown);
       }
       _ = tokio::time::sleep(Duration::from_millis(500))=>{}
@@ -259,7 +259,7 @@ fn setup_config_watcher(config_path: &str, tx: std::sync::mpsc::Sender<()>) -> a
   )?;
 
   watcher.watch(std::path::Path::new(config_path), RecursiveMode::NonRecursive)?;
-  debug!("Watching config file: {}", config_path);
+  debug!("watching config file: {}", config_path);
 
   Ok(watcher)
 }
@@ -281,7 +281,7 @@ async fn handle_config_reload(
   // Unregister removed services
   for port in to_remove {
     if let Some(svc) = services.remove(&port) {
-      info!("Unregistering removed service: {}", svc.1.name);
+      info!("unregistering removed service: {}", svc.1.name);
       write_frame(ctrl_send, &ClientControlMessage::DeregisterService(svc.1)).await?;
     }
   }
@@ -289,19 +289,19 @@ async fn handle_config_reload(
   // Register new services
   for svc in new_config.services {
     if !current_ports.contains(&svc.remote_port) {
-      info!("Registering new service: {}", svc.name);
+      info!("registering new service: {}", svc.name);
       write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone())).await?;
       services.insert(svc.remote_port, svc);
     } else if let Some(mut entry) = services.get_mut(&svc.remote_port) {
       // Update existing service if local_addr changed
       if entry.local_addr != svc.local_addr {
-        info!("Updating service {} local_addr: {} -> {}", svc.name, entry.local_addr, svc.local_addr);
+        info!("updating service {} local_addr: {} -> {}", svc.name, entry.local_addr, svc.local_addr);
         *entry = svc;
       }
     }
   }
 
-  debug!("Updated services list - {:?}", services);
+  debug!("updated services list - {:?}", services);
   Ok(())
 }
 
@@ -309,9 +309,9 @@ async fn register_services(ctrl_send: &mut SendStream, services: &ServiceRegistr
   for svc in services.iter() {
     let msg = ClientControlMessage::RegisterService(svc.clone());
     if let Err(e) = write_frame(ctrl_send, &msg).await {
-      warn!("Failed to register {}: {}", svc.name, e);
+      warn!("failed to register {}: {}", svc.name, e);
     } else {
-      debug!("Sent register for {}", svc.name);
+      debug!("sent register for {}", svc.name);
     }
   }
   Ok(())
@@ -323,19 +323,19 @@ async fn receive_control_messages(ctrl_recv: &mut RecvStream) {
       Ok(msg) => match msg {
         ServerAckMessage::ServiceRegistered { service_name, success, error } => {
           if success {
-            info!("Service '{}' registered", service_name);
+            info!("service '{}' registered", service_name);
           } else {
-            warn!("Service '{}' registration failed: {:?}", service_name, error);
+            warn!("service '{}' registration failed: {:?}", service_name, error);
           }
         }
         ServerAckMessage::ServiceUnregistered { service_name, success, .. } => {
           if success {
-            info!("Service '{}' unregistered", service_name);
+            info!("service '{}' unregistered", service_name);
           }
         }
       },
       Err(e) => {
-        debug!("Control receive ended: {}", e);
+        debug!("control receive ended: {}", e);
         break;
       }
     }
@@ -350,28 +350,28 @@ async fn accept_data_streams(conn: Connection, services: ServiceRegistry) {
   loop {
     match conn.accept_bi().await {
       Ok((mut quic_send, mut quic_recv)) => {
-        debug!("Accepted data stream from server");
+        debug!("accepted data stream from server");
         let services_clone = Arc::clone(&services);
 
         tokio::spawn(async move {
           match handle_data_stream(&mut quic_send, &mut quic_recv, &services_clone).await {
             Ok(()) => {}
             Err(e) => {
-              debug!("Data stream error: {}", e);
+              debug!("data stream error: {}", e);
               // Best-effort cleanup
               let code = VarInt::from_u32(1);
               if quic_send.reset(code).is_ok() {
-                trace!("Send stream reset");
+                trace!("send stream reset");
               }
               if quic_recv.stop(code).is_ok() {
-                trace!("Receive stream stopped");
+                trace!("receive stream stopped");
               }
             }
           }
         });
       }
       Err(e) => {
-        debug!("Accept stream failed: {}", e);
+        debug!("accept stream failed: {}", e);
         break;
       }
     }
@@ -386,13 +386,13 @@ async fn handle_data_stream(
   let port = read_port_header(quic_recv).await?;
 
   // Direct lookup by port instead of iteration
-  let service = services.get(&port).ok_or_else(|| anyhow::anyhow!("No service configured for port {}", port))?;
+  let service = services.get(&port).ok_or_else(|| anyhow::anyhow!("no service configured for port {}", port))?;
 
   let local_addr = service.local_addr.clone();
   let service_name = service.name.clone();
   drop(service); // Release lock before async operations
 
-  debug!("Proxying to local service: {} ({})", service_name, local_addr);
+  debug!("proxying to local service: {} ({})", service_name, local_addr);
 
   let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
   socket.set_keepalive(true)?;
@@ -407,7 +407,7 @@ async fn handle_data_stream(
   let std_tcp: std::net::TcpStream = socket.into();
   let _ = std_tcp.set_nonblocking(true);
   let local_tcp: tokio::net::TcpStream = tokio::net::TcpStream::from_std(std_tcp)?;
-  debug!("Connected to local service: {}", local_addr);
+  debug!("connected to local service: {}", local_addr);
 
   proxy_quic_to_tcp(local_tcp, quic_send, quic_recv).await;
   Ok(())
@@ -424,7 +424,7 @@ async fn proxy_quic_to_tcp(mut tcp: tokio::net::TcpStream, quic_send: &mut SendS
 
   let downstream = async {
     let res = copy(quic_recv, &mut tcp_w).await;
-    trace!("Server side closed (external client disconnected)");
+    trace!("server side closed (external client disconnected)");
     res
   };
 
@@ -434,16 +434,16 @@ async fn proxy_quic_to_tcp(mut tcp: tokio::net::TcpStream, quic_send: &mut SendS
   match select(upstream, downstream).await {
     Either::Left((res, _)) => {
       if let Err(e) = res {
-        debug!("Upstream (Local->QUIC) error: {}", e);
+        debug!("upstream (Local->QUIC) error: {}", e);
       } else {
-        debug!("Upstream completed, local service closed");
+        debug!("upstream completed, local service closed");
       }
     }
     Either::Right((res, _)) => {
       if let Err(e) = res {
-        debug!("Downstream (QUIC->Local) error: {}", e);
+        debug!("downstream (QUIC->Local) error: {}", e);
       } else {
-        debug!("Downstream completed, external client closed");
+        debug!("downstream completed, external client closed");
       }
     }
   }

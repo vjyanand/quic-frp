@@ -68,7 +68,7 @@ async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) ->
   trace!("new client with identity {}", client_identity);
 
   let (mut control_send, mut control_recv) = connection.accept_bi().await?; // Control Stream from client
-  debug!("Control stream established for {}", client_identity);
+  debug!("control stream established for {}", client_identity);
 
   loop {
     match read_frame::<ClientControlMessage, _>(&mut control_recv).await {
@@ -81,7 +81,7 @@ async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) ->
         }
       }
       Err(e) => {
-        debug!("Control stream ended for {}: {}", client_identity, e);
+        debug!("control stream ended for {}: {}", client_identity, e);
         break;
       }
     }
@@ -105,7 +105,7 @@ async fn handle_register_service(
     RegisterServiceResult::Registered(tcp_listener) => tcp_listener,
     RegisterServiceResult::OsError(msg)
     | RegisterServiceResult::AlreadyRegistered(msg)
-    | RegisterServiceResult::Unsolicited(msg) => {
+    | RegisterServiceResult::UnSolicited(msg) => {
       let ack = ServerAckMessage::ServiceRegistered { service_name, success: false, error: Some(msg) };
       write_frame(control_send, &ack).await?;
       return Ok(());
@@ -137,17 +137,17 @@ async fn register_service(
   client_identity: &ClientIdentity,
   registry: &PortRegistry,
 ) -> RegisterServiceResult {
-  debug!("RegisterService: {:?} from {}", def, client_identity);
+  debug!("registerService: {:?} from {}", def, client_identity);
 
   // Check existing registration - minimize lock duration
   let takeover_needed = registry.get(&def.remote_port).map(|existing| {
-    if client_identity.is_same_connection(&existing.client_identity) {
-      Err(format!("Port {} already registered by this connection {}", def.remote_port, client_identity))
+    if client_identity == &existing.client_identity {
+      Err(format!("port {} already registered by this connection {}", def.remote_port, client_identity))
     } else if client_identity.is_same_client(&existing.client_identity) {
       Ok(true) // Same client, different connection - takeover
     } else {
       Err(format!(
-        "Port {} conflict: requested by {} but owned by {} (service: {})",
+        "port {} conflict: requested by {} but owned by {} (service: {})",
         def.remote_port, client_identity, existing.client_identity, existing.service_name
       ))
     }
@@ -159,13 +159,13 @@ async fn register_service(
       return RegisterServiceResult::AlreadyRegistered(msg);
     }
     Some(Err(msg)) => {
-      return RegisterServiceResult::Unsolicited(msg);
+      return RegisterServiceResult::UnSolicited(msg);
     }
     Some(Ok(true)) => {
       info!("Port {} owned by stale connection, taking over for {}", def.remote_port, client_identity);
       if let Some((_, old_binding)) = registry.remove(&def.remote_port) {
         debug!(
-          "Cancelling listener for port {} (client={}, service={})",
+          "cancelling listener for port {} (client={}, service={})",
           def.remote_port, old_binding.client_identity, old_binding.service_name
         );
         old_binding.runtime_handle.abort();
@@ -176,11 +176,11 @@ async fn register_service(
 
   match create_tcp_listener_with_retry(def, 3).await {
     Ok(listener) => {
-      info!("Created listener for service '{}' on port {} for {}", def.name, def.remote_port, client_identity);
+      info!("created listener for service '{}' on port {} for {}", def.name, def.remote_port, client_identity);
       RegisterServiceResult::Registered(listener)
     }
     Err(e) => {
-      let msg = format!("Failed to create listener for port {} ({}): {}", def.remote_port, client_identity, e);
+      let msg = format!("failed to create listener for port {} ({}): {}", def.remote_port, client_identity, e);
       warn!("{}", msg);
       RegisterServiceResult::OsError(msg)
     }
@@ -210,33 +210,33 @@ async fn create_tcp_listener_with_retry(service: &ServiceDefinition, max_retries
     match tokio::net::TcpListener::try_from(std_listener) {
       Ok(listener) => {
         if attempt > 0 {
-          debug!("Successfully bound TCP listener on {} after {} retries", bind_addr, attempt);
+          debug!("successfully bound TCP listener on {} after {} retries", bind_addr, attempt);
         } else {
-          debug!("Bound TCP listener: {}", bind_addr);
+          debug!("bound TCP listener: {}", bind_addr);
         }
         return Ok(listener);
       }
       Err(e) => {
         last_error = Some(e);
         if attempt < max_retries {
-          debug!("Failed to bind {} (attempt {}), retrying: {}", bind_addr, attempt + 1, last_error.as_ref().unwrap());
+          debug!("failed to bind {} (attempt {}), retrying: {}", bind_addr, attempt + 1, last_error.as_ref().unwrap());
           tokio::time::sleep(retry_delay).await;
         }
       }
     }
   }
 
-  Err(anyhow::anyhow!("Failed to bind {} after {} attempts: {}", bind_addr, max_retries + 1, last_error.unwrap()))
+  Err(anyhow::anyhow!("failed to bind {} after {} attempts: {}", bind_addr, max_retries + 1, last_error.unwrap()))
 }
 
 async fn accept_tcp_connections(conn: &Connection, listener: TcpListener, service: &ServiceDefinition) {
   let port = service.remote_port;
-  info!("Accepting TCP connections on port {} for service '{}'", port, service.name);
+  info!("accepting TCP connections on port {} for service '{}'", port, service.name);
 
   loop {
     match listener.accept().await {
       Ok((tcp_stream, peer_addr)) => {
-        debug!("Accepted TCP connection on port {} from {}", port, peer_addr);
+        debug!("accepted TCP connection on port {} from {}", port, peer_addr);
         let conn_clone = conn.clone();
         tokio::spawn(async move {
           if let Err(e) = handle_tcp_connection(conn_clone, tcp_stream, port, peer_addr).await {
@@ -258,13 +258,13 @@ async fn handle_tcp_connection(
   port: u16,
   peer_addr: SocketAddr,
 ) -> anyhow::Result<()> {
-  debug!("Opening QUIC stream for TCP peer {}", peer_addr);
+  debug!("opening QUIC stream for TCP peer {}", peer_addr);
   let (mut quic_send, mut quic_recv) =
-    conn.open_bi().await.map_err(|e| anyhow::anyhow!("Failed to open QUIC stream: {}", e))?;
-  debug!("Opened QUIC stream for TCP peer {}", peer_addr);
+    conn.open_bi().await.map_err(|e| anyhow::anyhow!("failed to open QUIC stream: {}", e))?;
+  debug!("opened QUIC stream for TCP peer {}", peer_addr);
 
   // Write port header
-  quic_send.write_all(&port.to_be_bytes()).await.map_err(|e| anyhow::anyhow!("Failed to write port header: {}", e))?;
+  quic_send.write_all(&port.to_be_bytes()).await.map_err(|e| anyhow::anyhow!("failed to write port header: {}", e))?;
 
   proxy_tcp_to_quic(tcp_stream, &mut quic_send, &mut quic_recv).await?;
   debug!("TCP connection {} closed", peer_addr);
@@ -292,12 +292,12 @@ async fn proxy_tcp_to_quic(
   match select(upstream, downstream).await {
     Either::Left((res, _)) => {
       if let Err(e) = res {
-        debug!("Upstream (TCP->QUIC) {}", e);
+        debug!("upstream (TCP->QUIC) {}", e);
       }
     }
     Either::Right((res, _)) => {
       if let Err(e) = res {
-        debug!("Downstream (QUIC->TCP) error: {}", e);
+        debug!("downstream (QUIC->TCP) error: {}", e);
       }
     }
   }
@@ -311,14 +311,14 @@ async fn handle_unregister_service(
   client_identity: &ClientIdentity,
   registry: &PortRegistry,
 ) -> anyhow::Result<()> {
-  debug!("UnregisterService: {:?} from {}", def, client_identity);
+  debug!("unregisterService: {:?} from {}", def, client_identity);
 
   let success = remove_port(def.remote_port, registry, client_identity);
 
   let ack = ServerAckMessage::ServiceUnregistered {
     service_name: def.name,
     success,
-    error: (!success).then(|| "Port not owned by this connection".to_string()),
+    error: (!success).then(|| "port not owned by this connection".to_string()),
   };
   write_frame(control_send, &ack).await?;
   Ok(())
@@ -338,21 +338,21 @@ fn cleanup_listeners(registry: &PortRegistry, client: &ClientIdentity) {
   }
 
   if cleaned > 0 {
-    info!("Cleaned up {} ports for {}", cleaned, client);
+    info!("cleaned up {} ports for {}", cleaned, client);
   }
 }
 
 fn remove_port(port: u16, registry: &PortRegistry, client: &ClientIdentity) -> bool {
-  let owns_port = registry.get(&port).map(|entry| client.is_same_connection(&entry.client_identity)).unwrap_or(false);
+  let owns_port = registry.get(&port).map(|entry| client == &entry.client_identity).unwrap_or(false);
 
   if owns_port {
     if let Some((_, binding)) = registry.remove(&port) {
       binding.runtime_handle.abort();
-      debug!("Cleaned up port {} (service: {})", port, binding.service_name);
+      debug!("cleaned up port {} (service: {})", port, binding.service_name);
       return true;
     }
   } else if registry.contains_key(&port) {
-    debug!("Port {} was taken over, skipping cleanup", port);
+    debug!("port {} was taken over, skipping cleanup", port);
   }
   false
 }
@@ -465,15 +465,14 @@ impl ClientIdentity {
     self.remote_ip == other.remote_ip
   }
 
-  fn is_same_connection(&self, other: &Self) -> bool {
-    self.remote_ip == other.remote_ip && self.identifier == other.identifier
-  }
-
   fn get_ports(&self, registry: &PortRegistry) -> Vec<u16> {
-    registry
-      .iter()
-      .filter_map(|entry| self.is_same_connection(&entry.client_identity).then_some(*entry.key()))
-      .collect()
+    registry.iter().filter_map(|entry| (self == &entry.client_identity).then_some(*entry.key())).collect()
+  }
+}
+
+impl PartialEq for ClientIdentity {
+  fn eq(&self, other: &Self) -> bool {
+    self.remote_ip == other.remote_ip && self.identifier == other.identifier
   }
 }
 
@@ -487,6 +486,6 @@ impl std::fmt::Display for ClientIdentity {
 enum RegisterServiceResult {
   Registered(TcpListener),
   AlreadyRegistered(String),
-  Unsolicited(String),
+  UnSolicited(String),
   OsError(String),
 }
