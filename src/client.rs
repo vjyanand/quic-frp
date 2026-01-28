@@ -390,6 +390,8 @@ async fn handle_data_stream(
 
   let local_addr = service.local_addr.clone();
   let service_name = service.name.clone();
+  let compression = service.compression.unwrap_or_default();
+
   drop(service); // Release lock before async operations
 
   debug!("proxying to local service: {} ({})", service_name, local_addr);
@@ -409,24 +411,40 @@ async fn handle_data_stream(
   let local_tcp: tokio::net::TcpStream = tokio::net::TcpStream::from_std(std_tcp)?;
   debug!("connected to local service: {}", local_addr);
 
-  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv).await;
+  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv, compression).await;
   Ok(())
 }
 
-async fn proxy_quic_to_tcp(mut tcp: tokio::net::TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
+async fn proxy_quic_to_tcp(
+  mut tcp: tokio::net::TcpStream,
+  quic_send: &mut SendStream,
+  quic_recv: &mut RecvStream,
+  compression: bool,
+) {
   let (mut tcp_r, mut tcp_w) = tcp.split();
-
   let upstream = async {
-    let result = copy(&mut tcp_r, quic_send).await;
-    let _ = quic_send.finish();
-    result
+    if compression {
+      let mut snappy_send = tokio_snappy::SnappyIO::new(quic_send);
+      let upstream = copy(&mut tcp_r, &mut snappy_send).await;
+      let _ = snappy_send.into_inner().finish();
+      upstream
+    } else {
+      let upstream = copy(&mut tcp_r, quic_send).await;
+      let _ = quic_send.finish();
+      upstream
+    }
   };
 
   let downstream = async {
-    let res = copy(quic_recv, &mut tcp_w).await;
-    trace!("server side closed (external client disconnected)");
-    res
+    if compression {
+      let mut snapp_recv = tokio_snappy::SnappyIO::new(quic_recv);
+      copy(&mut snapp_recv, &mut tcp_w).await
+    } else {
+      copy(quic_recv, &mut tcp_w).await
+    }
   };
+
+  trace!("compression {compression}");
 
   let upstream = pin!(upstream);
   let downstream = pin!(downstream);

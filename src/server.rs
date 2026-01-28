@@ -238,8 +238,10 @@ async fn accept_tcp_connections(conn: &Connection, listener: TcpListener, servic
       Ok((tcp_stream, peer_addr)) => {
         debug!("accepted TCP connection on port {} from {}", port, peer_addr);
         let conn_clone = conn.clone();
+        let compression = service.compression.unwrap_or_default();
+
         tokio::spawn(async move {
-          if let Err(e) = handle_tcp_connection(conn_clone, tcp_stream, port, peer_addr).await {
+          if let Err(e) = handle_tcp_connection(conn_clone, tcp_stream, port, peer_addr, compression).await {
             warn!("TCP connection handler error for {}: {}", peer_addr, e);
           }
         });
@@ -257,6 +259,7 @@ async fn handle_tcp_connection(
   tcp_stream: TcpStream,
   port: u16,
   peer_addr: SocketAddr,
+  compression: bool,
 ) -> anyhow::Result<()> {
   debug!("opening QUIC stream for TCP peer {}", peer_addr);
   let (mut quic_send, mut quic_recv) =
@@ -266,7 +269,7 @@ async fn handle_tcp_connection(
   // Write port header
   quic_send.write_all(&port.to_be_bytes()).await.map_err(|e| anyhow::anyhow!("failed to write port header: {}", e))?;
 
-  proxy_tcp_to_quic(tcp_stream, &mut quic_send, &mut quic_recv).await?;
+  proxy_tcp_to_quic(tcp_stream, &mut quic_send, &mut quic_recv, compression).await?;
   debug!("TCP connection {} closed", peer_addr);
   Ok(())
 }
@@ -275,16 +278,33 @@ async fn proxy_tcp_to_quic(
   mut tcp: TcpStream,
   quic_send: &mut SendStream,
   quic_recv: &mut RecvStream,
+  compression: bool,
 ) -> anyhow::Result<()> {
   let (mut tcp_r, mut tcp_w) = tcp.split();
 
   let upstream = async {
-    let result = copy(&mut tcp_r, quic_send).await;
-    let _ = quic_send.finish(); // Ignore finish errors
-    result
+    if compression {
+      let mut snappy_send = tokio_snappy::SnappyIO::new(quic_send);
+      let result = copy(&mut tcp_r, &mut snappy_send).await;
+      let _ = snappy_send.into_inner().finish();
+      result
+    } else {
+      let result = copy(&mut tcp_r, quic_send).await;
+      let _ = quic_send.finish();
+      result
+    }
   };
 
-  let downstream = async { copy(quic_recv, &mut tcp_w).await };
+  let downstream = async {
+    if compression {
+      let mut snappy_recv = tokio_snappy::SnappyIO::new(quic_recv);
+      copy(&mut snappy_recv, &mut tcp_w).await
+    } else {
+      copy(quic_recv, &mut tcp_w).await
+    }
+  };
+
+  trace!("compression {compression}");
 
   let upstream = std::pin::pin!(upstream);
   let downstream = std::pin::pin!(downstream);
