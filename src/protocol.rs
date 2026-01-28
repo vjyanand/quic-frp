@@ -22,7 +22,7 @@ pub enum ServerAckMessage {
 
 pub async fn read_frame<T: for<'a> bitcode::Decode<'a>, R: AsyncRead + Unpin>(reader: &mut R) -> anyhow::Result<T> {
   let frame_len = reader.read_u8().await?;
-  trace!("Reading frame of length {}", frame_len);
+  trace!("reading frame of length {}", frame_len);
 
   let mut buf = vec![0u8; frame_len as usize];
   reader.read_exact(&mut buf[..]).await?;
@@ -33,7 +33,7 @@ pub async fn read_frame<T: for<'a> bitcode::Decode<'a>, R: AsyncRead + Unpin>(re
 pub async fn write_frame<T: bitcode::Encode, W: AsyncWrite + Unpin>(writer: &mut W, frame: &T) -> anyhow::Result<()> {
   let serialized = bitcode::encode(frame);
   let len = serialized.len() as u8;
-  trace!("Writing frame of length {:?}", len);
+  trace!("writing frame of length {:?}", len);
 
   // Write 4-byte length
   writer.write_u8(len).await?;

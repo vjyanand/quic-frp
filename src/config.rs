@@ -13,6 +13,7 @@ pub struct ServiceDefinition {
   pub name: String,
   pub remote_port: u16,
   pub prefer_ipv6: Option<bool>,
+  pub compression: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,7 +62,7 @@ impl Config {
       return Ok(Config::Client(client_root_config.client));
     }
     toml::from_str::<ClientRootConfig>(&content)?;
-    Err(anyhow::anyhow!("Invalid config: must have [server] or [client] section"))
+    Err(anyhow::anyhow!("invalid config: must have [server] or [client] section"))
   }
   pub fn load_client(path: &str) -> anyhow::Result<ClientConfig> {
     let content = std::fs::read_to_string(path)?;
