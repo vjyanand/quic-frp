@@ -271,12 +271,18 @@ async fn handle_config_reload(
 ) -> anyhow::Result<()> {
   let new_config = Config::load_client(config_path)?;
 
-  // Use iterators directly without intermediate HashSet allocations where possible
+  // Only create HashSet for new ports (typically smaller)
   let new_ports: HashSet<u16> = new_config.services.iter().map(|s| s.remote_port).collect();
-  let current_ports: HashSet<u16> = services.iter().map(|e| *e.key()).collect();
 
-  // Collect removals and additions
-  let to_remove: Vec<u16> = current_ports.difference(&new_ports).copied().collect();
+  // Find services to remove by iterating current services
+  // No need to collect into a Vec first
+  let to_remove: Vec<u16> = services
+    .iter()
+    .filter_map(|entry| {
+      let port = *entry.key();
+      if !new_ports.contains(&port) { Some(port) } else { None }
+    })
+    .collect();
 
   // Unregister removed services
   for port in to_remove {
@@ -286,17 +292,21 @@ async fn handle_config_reload(
     }
   }
 
-  // Register new services
+  // Register or update services
   for svc in new_config.services {
-    if !current_ports.contains(&svc.remote_port) {
-      info!("registering new service: {}", svc.name);
-      write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone())).await?;
-      services.insert(svc.remote_port, svc);
-    } else if let Some(mut entry) = services.get_mut(&svc.remote_port) {
-      // Update existing service if local_addr changed
-      if entry.local_addr != svc.local_addr {
-        info!("updating service {} local_addr: {} -> {}", svc.name, entry.local_addr, svc.local_addr);
-        *entry = svc;
+    match services.get_mut(&svc.remote_port) {
+      Some(mut entry) => {
+        // Update existing service if local_addr changed
+        if entry.local_addr != svc.local_addr || entry.compression != svc.compression {
+          info!("updating service {} local_addr: {} -> {}", svc.name, entry.local_addr, svc.local_addr);
+          *entry = svc;
+        }
+      }
+      None => {
+        // Register new service
+        info!("Registering new service: {}", svc.name);
+        write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone())).await?;
+        services.insert(svc.remote_port, svc);
       }
     }
   }
@@ -390,6 +400,8 @@ async fn handle_data_stream(
 
   let local_addr = service.local_addr.clone();
   let service_name = service.name.clone();
+  let compression = service.compression.unwrap_or_default();
+
   drop(service); // Release lock before async operations
 
   debug!("proxying to local service: {} ({})", service_name, local_addr);
@@ -409,24 +421,40 @@ async fn handle_data_stream(
   let local_tcp: tokio::net::TcpStream = tokio::net::TcpStream::from_std(std_tcp)?;
   debug!("connected to local service: {}", local_addr);
 
-  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv).await;
+  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv, compression).await;
   Ok(())
 }
 
-async fn proxy_quic_to_tcp(mut tcp: tokio::net::TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
+async fn proxy_quic_to_tcp(
+  mut tcp: tokio::net::TcpStream,
+  quic_send: &mut SendStream,
+  quic_recv: &mut RecvStream,
+  compression: bool,
+) {
   let (mut tcp_r, mut tcp_w) = tcp.split();
-
   let upstream = async {
-    let result = copy(&mut tcp_r, quic_send).await;
-    let _ = quic_send.finish();
-    result
+    if compression {
+      let mut snappy_send = tokio_snappy::SnappyIO::new(quic_send);
+      let upstream = copy(&mut tcp_r, &mut snappy_send).await;
+      let _ = snappy_send.into_inner().finish();
+      upstream
+    } else {
+      let upstream = copy(&mut tcp_r, quic_send).await;
+      let _ = quic_send.finish();
+      upstream
+    }
   };
 
   let downstream = async {
-    let res = copy(quic_recv, &mut tcp_w).await;
-    trace!("server side closed (external client disconnected)");
-    res
+    if compression {
+      let mut snapp_recv = tokio_snappy::SnappyIO::new(quic_recv);
+      copy(&mut snapp_recv, &mut tcp_w).await
+    } else {
+      copy(quic_recv, &mut tcp_w).await
+    }
   };
+
+  trace!("compression {compression}");
 
   let upstream = pin!(upstream);
   let downstream = pin!(downstream);

@@ -13,6 +13,7 @@ pub struct ServiceDefinition {
   pub name: String,
   pub remote_port: u16,
   pub prefer_ipv6: Option<bool>,
+  pub compression: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
