@@ -50,15 +50,15 @@ impl TlsServerCertConfig {
     let certs = load_certs(cert_path)?;
 
     if certs.is_empty() {
-      return Err(anyhow!("No certificates found in {}", cert_path.display()));
+      return Err(anyhow!("no certificates found in {}", cert_path.display()));
     }
 
     // Read private key
-    let key_file = File::open(key_path).with_context(|| format!("Failed to open key file {}", key_path.display()))?;
+    let key_file = File::open(key_path).with_context(|| format!("failed to open key file {}", key_path.display()))?;
     let mut key_reader = BufReader::new(key_file);
 
     let key = rustls_pemfile::private_key(&mut key_reader)
-      .with_context(|| format!("Failed to parse private key PEM: {}", key_path.display()))?
+      .with_context(|| format!("failed to parse private key PEM: {}", key_path.display()))?
       .ok_or_else(|| anyhow!("No private key found in {}", key_path.display()))?;
 
     debug!("loaded certificate from file");
@@ -74,13 +74,13 @@ impl TlsServerCertConfig {
 
 fn generate_self_signed(san: &[String]) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
   let rcgen::CertifiedKey { cert, signing_key } =
-    rcgen::generate_simple_self_signed(san.to_vec()).map_err(|e| anyhow!("Failed to generate certificate: {}", e))?;
+    rcgen::generate_simple_self_signed(san.to_vec()).map_err(|e| anyhow!("failed to generate certificate: {}", e))?;
 
   let cert_der = cert.der().clone();
   let key_der = signing_key
     .serialize_der()
     .try_into() // Convert Vec<u8> to PrivateKeyDer via TryInto
-    .map_err(|_| anyhow!("Failed to serialize private key"))?;
+    .map_err(|_| anyhow!("failed to serialize private key"))?;
 
   debug!("generated self signed certificate");
   Ok((vec![cert_der], key_der))
@@ -124,7 +124,7 @@ impl TlsClientCertConfig {
     let certs = load_certs(&cert_path)?;
 
     if certs.is_empty() {
-      return Err(anyhow!("No certificates found in {}", cert_path.display()));
+      return Err(anyhow!("no certificates found in {}", cert_path.display()));
     }
 
     // Add all certificates to root store
@@ -166,11 +166,11 @@ impl TlsClientCertConfig {
 
 /// Helper to just load certs for Root Store population
 fn load_certs(path: &PathBuf) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-  let file = File::open(path).with_context(|| format!("Failed to open cert file {}", path.display()))?;
+  let file = File::open(path).with_context(|| format!("failed to open cert file {}", path.display()))?;
   let mut reader = BufReader::new(file);
   rustls_pemfile::certs(&mut reader)
     .collect::<Result<Vec<_>, _>>()
-    .with_context(|| format!("Failed to parse certificates from {}", path.display()))
+    .with_context(|| format!("failed to parse certificates from {}", path.display()))
 }
 
 //Borrowed from https://github.com/compio-rs/compio/blob/ce3c0455027b055e6a8a4b5e9b8ee947f1b71746/compio-quic/src/builder.rs#L225

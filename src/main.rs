@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     .init();
 
   let cli = Cli::try_parse()?;
-  debug!("Using config file {}", cli.config);
+  debug!("using config file {}", cli.config);
   let config = Config::load(&cli.config)?;
   match config {
     Config::Server(server_config) => run_server(server_config).await,

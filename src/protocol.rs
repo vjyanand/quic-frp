@@ -1,7 +1,9 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::config::ServiceDefinition;
+
+const MAX_FRAME_LEN: usize = 64 * 1024;
 
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 pub enum ClientControlMessage {
@@ -21,25 +23,45 @@ pub enum ServerAckMessage {
 }
 
 pub async fn read_frame<T: for<'a> bitcode::Decode<'a>, R: AsyncRead + Unpin>(reader: &mut R) -> anyhow::Result<T> {
-  let frame_len = reader.read_u8().await?;
-  trace!("Reading frame of length {}", frame_len);
+  let frame_len = match reader.read_u16().await {
+    Ok(n) => n as usize,
+    Err(e) => {
+      debug!("read_frame: failed reading length prefix: kind={:?} err={}", e.kind(), e);
+      return Err(e.into());
+    }
+  };
+  debug!("read_frame: length prefix = {} bytes (type={})", frame_len, std::any::type_name::<T>());
 
-  let mut buf = vec![0u8; frame_len as usize];
-  reader.read_exact(&mut buf[..]).await?;
-  let frame = bitcode::decode::<T>(&buf)?;
-  Ok(frame)
+  if frame_len > MAX_FRAME_LEN {
+    return Err(anyhow::anyhow!("frame length {} exceeds maximum {}", frame_len, MAX_FRAME_LEN));
+  }
+  if frame_len == 0 {
+    debug!("read_frame: ZERO-length frame — likely length-prefix desync");
+    return Err(anyhow::anyhow!("zero-length frame"));
+  }
+
+  let mut buf = vec![0u8; frame_len];
+  if let Err(e) = reader.read_exact(&mut buf[..]).await {
+    debug!("read_frame: failed reading body of {} bytes: kind={:?} err={}", frame_len, e.kind(), e);
+    return Err(e.into());
+  }
+
+  match bitcode::decode::<T>(&buf) {
+    Ok(frame) => Ok(frame),
+    Err(e) => Err(anyhow::anyhow!("bitcode decode error: {} (frame_len={})", e, frame_len)),
+  }
 }
 
 pub async fn write_frame<T: bitcode::Encode, W: AsyncWrite + Unpin>(writer: &mut W, frame: &T) -> anyhow::Result<()> {
   let serialized = bitcode::encode(frame);
-  let len = serialized.len() as u8;
-  trace!("Writing frame of length {:?}", len);
-
-  // Write 4-byte length
-  writer.write_u8(len).await?;
-
-  // Write payload
+  if serialized.len() > MAX_FRAME_LEN {
+    return Err(anyhow::anyhow!("frame length {} exceeds maximum {}", serialized.len(), MAX_FRAME_LEN));
+  }
+  let len = serialized.len() as u16;
+  writer.write_u16(len).await?;
   writer.write_all(&serialized).await?;
+  writer.flush().await?;
+  trace!("write_frame: flushed {} bytes (+2 length prefix)", len);
   Ok(())
 }
 
