@@ -3,17 +3,20 @@ use std::{
   net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
   pin::pin,
   sync::Arc,
-  time::Duration,
+  time::{Duration, Instant},
 };
 
+/// A session must stay up at least this long before we treat it as "healthy"
+/// and reset the reconnect backoff. Prevents tight loops when the server
+/// accepts the QUIC handshake but the session dies immediately after.
+const HEALTHY_SESSION_THRESHOLD: Duration = Duration::from_secs(30);
+
 use dashmap::DashMap;
-use futures::future::{Either, select};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use quinn::{
   Connection, Endpoint, IdleTimeout, RecvStream, SendStream, TransportConfig, VarInt, congestion,
   crypto::rustls::QuicClientConfig,
 };
-use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{io::copy, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
@@ -59,27 +62,48 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
     match connect_to_server(server_addr, local_bind, &alpn, tls_config.clone()).await {
       Ok(conn) => {
         info!("connected to server");
-        backoff.reset();
+        let session_start = Instant::now();
 
-        match handle_connection(conn, &services, config_path, shutdown.clone()).await {
+        let outcome = handle_connection(conn, &services, config_path, shutdown.clone()).await;
+
+        if session_start.elapsed() >= HEALTHY_SESSION_THRESHOLD {
+          backoff.reset();
+        }
+
+        match outcome {
           Ok(LoopControl::Shutdown) => {
             info!("clean shutdown requested");
             break;
           }
           Ok(LoopControl::Reconnect) => {
-            info!("reconnecting...");
+            let delay = backoff.next_delay();
+            info!("reconnecting in {}s", delay.as_secs());
+            tokio::select! {
+              _ = tokio::time::sleep(delay) => {}
+              _ = shutdown.cancelled() => {
+                info!("shutdown during reconnect backoff");
+                break;
+              }
+            }
           }
           Err(e) => {
-            warn!("connection error: {}", e);
+            let delay = backoff.next_delay();
+            warn!("connection error: {}, retrying in {}s", e, delay.as_secs());
+            tokio::select! {
+              _ = tokio::time::sleep(delay) => {}
+              _ = shutdown.cancelled() => {
+                info!("shutdown during retry backoff");
+                break;
+              }
+            }
           }
         }
       }
       Err(e) => {
         let delay = backoff.next_delay();
+        warn!("connection failed: {}, retrying in {}s", e, delay.as_secs());
         tokio::select! {
-          _ = tokio::time::sleep(delay) => {
-            warn!("connection failed: {}, retrying in {}s", e, delay.as_secs());
-          }
+          _ = tokio::time::sleep(delay) => {}
           _ = shutdown.cancelled() => {
             info!("shutdown during retry backoff");
             break;
@@ -271,12 +295,18 @@ async fn handle_config_reload(
 ) -> anyhow::Result<()> {
   let new_config = Config::load_client(config_path)?;
 
-  // Use iterators directly without intermediate HashSet allocations where possible
+  // Only create HashSet for new ports (typically smaller)
   let new_ports: HashSet<u16> = new_config.services.iter().map(|s| s.remote_port).collect();
-  let current_ports: HashSet<u16> = services.iter().map(|e| *e.key()).collect();
 
-  // Collect removals and additions
-  let to_remove: Vec<u16> = current_ports.difference(&new_ports).copied().collect();
+  // Find services to remove by iterating current services
+  // No need to collect into a Vec first
+  let to_remove: Vec<u16> = services
+    .iter()
+    .filter_map(|entry| {
+      let port = *entry.key();
+      if !new_ports.contains(&port) { Some(port) } else { None }
+    })
+    .collect();
 
   // Unregister removed services
   for port in to_remove {
@@ -286,17 +316,21 @@ async fn handle_config_reload(
     }
   }
 
-  // Register new services
+  // Register or update services
   for svc in new_config.services {
-    if !current_ports.contains(&svc.remote_port) {
-      info!("registering new service: {}", svc.name);
-      write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone())).await?;
-      services.insert(svc.remote_port, svc);
-    } else if let Some(mut entry) = services.get_mut(&svc.remote_port) {
-      // Update existing service if local_addr changed
-      if entry.local_addr != svc.local_addr {
-        info!("updating service {} local_addr: {} -> {}", svc.name, entry.local_addr, svc.local_addr);
-        *entry = svc;
+    match services.get_mut(&svc.remote_port) {
+      Some(mut entry) => {
+        // Update existing service if local_addr changed
+        if entry.local_addr != svc.local_addr || entry.compression != svc.compression {
+          info!("updating service {} local_addr: {} -> {}", svc.name, entry.local_addr, svc.local_addr);
+          *entry = svc;
+        }
+      }
+      None => {
+        // Register new service
+        info!("Registering new service: {}", svc.name);
+        write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone())).await?;
+        services.insert(svc.remote_port, svc);
       }
     }
   }
@@ -390,60 +424,71 @@ async fn handle_data_stream(
 
   let local_addr = service.local_addr.clone();
   let service_name = service.name.clone();
+  let compression = service.compression.unwrap_or_default();
+
   drop(service); // Release lock before async operations
 
   debug!("proxying to local service: {} ({})", service_name, local_addr);
 
-  let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-  socket.set_keepalive(true)?;
-  socket.set_tcp_nodelay(true)?;
+  let resolved = local_addr
+    .to_socket_addrs()?
+    .next()
+    .ok_or_else(|| anyhow::anyhow!("no address resolved for local service {}", local_addr))?;
+  let local_tcp = tokio::net::TcpStream::connect(resolved).await?;
+  let sock_ref = socket2::SockRef::from(&local_tcp);
+  sock_ref.set_tcp_nodelay(true)?;
   let keepalive = socket2::TcpKeepalive::new()
     .with_interval(Duration::from_secs(10))
     .with_retries(5)
     .with_time(Duration::from_secs(60));
-  socket.set_tcp_keepalive(&keepalive)?;
-  let sock_addr = socket2::SockAddr::from(local_addr.to_socket_addrs()?.next().unwrap());
-  socket.connect(&sock_addr)?;
-  let std_tcp: std::net::TcpStream = socket.into();
-  let _ = std_tcp.set_nonblocking(true);
-  let local_tcp: tokio::net::TcpStream = tokio::net::TcpStream::from_std(std_tcp)?;
+  sock_ref.set_tcp_keepalive(&keepalive)?;
   debug!("connected to local service: {}", local_addr);
 
-  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv).await;
+  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv, compression).await;
   Ok(())
 }
 
-async fn proxy_quic_to_tcp(mut tcp: tokio::net::TcpStream, quic_send: &mut SendStream, quic_recv: &mut RecvStream) {
+async fn proxy_quic_to_tcp(
+  mut tcp: tokio::net::TcpStream,
+  quic_send: &mut SendStream,
+  quic_recv: &mut RecvStream,
+  compression: bool,
+) {
+  use tokio::io::AsyncWriteExt;
   let (mut tcp_r, mut tcp_w) = tcp.split();
-
   let upstream = async {
-    let result = copy(&mut tcp_r, quic_send).await;
-    let _ = quic_send.finish();
-    result
+    if compression {
+      let mut snappy_send = tokio_snappy::SnappyIO::new(quic_send);
+      let res = copy(&mut tcp_r, &mut snappy_send).await;
+      let _ = snappy_send.into_inner().finish();
+      res
+    } else {
+      let res = copy(&mut tcp_r, quic_send).await;
+      let _ = quic_send.finish();
+      res
+    }
   };
 
   let downstream = async {
-    let res = copy(quic_recv, &mut tcp_w).await;
-    trace!("server side closed (external client disconnected)");
+    let res = if compression {
+      let mut snappy_recv = tokio_snappy::SnappyIO::new(quic_recv);
+      copy(&mut snappy_recv, &mut tcp_w).await
+    } else {
+      copy(quic_recv, &mut tcp_w).await
+    };
+    let _ = tcp_w.shutdown().await;
     res
   };
 
-  let upstream = pin!(upstream);
-  let downstream = pin!(downstream);
+  trace!("compression {compression}");
 
-  match select(upstream, downstream).await {
-    Either::Left((res, _)) => {
-      if let Err(e) = res {
+  match tokio::join!(upstream, downstream) {
+    (up, down) => {
+      if let Err(e) = up {
         debug!("upstream (Local->QUIC) error: {}", e);
-      } else {
-        debug!("upstream completed, local service closed");
       }
-    }
-    Either::Right((res, _)) => {
-      if let Err(e) = res {
+      if let Err(e) = down {
         debug!("downstream (QUIC->Local) error: {}", e);
-      } else {
-        debug!("downstream completed, external client closed");
       }
     }
   }

@@ -1,12 +1,10 @@
 use crate::protocol::{ServerAckMessage, write_frame};
-use crate::tls;
 use crate::{
   config::ServiceDefinition,
   protocol::{ClientControlMessage, read_frame},
-  tls::TlsServerCertConfig,
+  tls::{self, TlsServerCertConfig},
 };
 use dashmap::DashMap;
-use futures::future::{Either, select};
 use quinn::{
   Connection, Endpoint, EndpointConfig, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
   crypto::rustls::QuicServerConfig, default_runtime,
@@ -15,7 +13,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::copy;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 type PortRegistry = Arc<DashMap<u16, PortBinding>>;
@@ -48,7 +46,7 @@ pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<(
   loop {
     let Some(incoming) = endpoint.accept().await else {
       warn!("endpoint closed, shutting down");
-      continue;
+      break;
     };
 
     let registry = Arc::clone(&registry);
@@ -57,6 +55,8 @@ pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<(
       debug!("result: {:?}", result);
     });
   }
+
+  Ok(())
 }
 
 async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) -> anyhow::Result<()> {
@@ -70,25 +70,34 @@ async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) ->
   let (mut control_send, mut control_recv) = connection.accept_bi().await?; // Control Stream from client
   debug!("control stream established for {}", client_identity);
 
-  loop {
-    match read_frame::<ClientControlMessage, _>(&mut control_recv).await {
-      Ok(ClientControlMessage::RegisterService(def)) => {
-        handle_register_service(def, &connection, &mut control_send, &client_identity, &registry).await?;
-      }
-      Ok(ClientControlMessage::DeregisterService(def)) => {
-        if let Err(e) = handle_unregister_service(def, &mut control_send, &client_identity, &registry).await {
-          warn!("handle_unregister_service error: {:?}", e);
+  let loop_result: anyhow::Result<()> = async {
+    loop {
+      match read_frame::<ClientControlMessage, _>(&mut control_recv).await {
+        Ok(ClientControlMessage::RegisterService(def)) => {
+          if let Err(e) =
+            handle_register_service(def, &connection, &mut control_send, &client_identity, &registry).await
+          {
+            warn!("handle_register_service error: {:?}", e);
+            return Err(e);
+          }
+        }
+        Ok(ClientControlMessage::DeregisterService(def)) => {
+          if let Err(e) = handle_unregister_service(def, &mut control_send, &client_identity, &registry).await {
+            warn!("handle_unregister_service error: {:?}", e);
+          }
+        }
+        Err(e) => {
+          debug!("control stream ended for {}: {:#}  (chain: {:?})", client_identity, e, e);
+          break;
         }
       }
-      Err(e) => {
-        debug!("control stream ended for {}: {}", client_identity, e);
-        break;
-      }
     }
+    Ok(())
   }
+  .await;
 
   cleanup_listeners(&registry, &client_identity);
-  Ok(())
+  loop_result
 }
 
 async fn handle_register_service(
@@ -116,17 +125,16 @@ async fn handle_register_service(
   let ack = ServerAckMessage::ServiceRegistered { service_name: service_name.clone(), success: true, error: None };
   write_frame(control_send, &ack).await?;
 
+  let cancel = CancellationToken::new();
   let conn_clone = conn.clone();
   let def_clone = def.clone();
-  let runtime_handle = tokio::spawn(async move {
-    accept_tcp_connections(&conn_clone, tcp_listener, &def_clone).await;
+  let listener_cancel = cancel.clone();
+  tokio::spawn(async move {
+    accept_tcp_connections(&conn_clone, tcp_listener, &def_clone, listener_cancel).await;
   });
 
-  let port_binding = PortBinding {
-    client_identity: client_identity.clone(),
-    service_name: service_name.into_boxed_str(),
-    runtime_handle,
-  };
+  let port_binding =
+    PortBinding { client_identity: client_identity.clone(), service_name: service_name.into_boxed_str(), cancel };
 
   registry.insert(service_port, port_binding);
   Ok(())
@@ -140,38 +148,27 @@ async fn register_service(
   debug!("registerService: {:?} from {}", def, client_identity);
 
   // Check existing registration - minimize lock duration
-  let takeover_needed = registry.get(&def.remote_port).map(|existing| {
+  if let Some(existing) = registry.get(&def.remote_port) {
     if client_identity == &existing.client_identity {
-      Err(format!("port {} already registered by this connection {}", def.remote_port, client_identity))
+      return RegisterServiceResult::AlreadyRegistered(format!(
+        "port {} already registered by this connection {}",
+        def.remote_port, client_identity
+      ));
     } else if client_identity.is_same_client(&existing.client_identity) {
-      Ok(true) // Same client, different connection - takeover
-    } else {
-      Err(format!(
-        "port {} conflict: requested by {} but owned by {} (service: {})",
-        def.remote_port, client_identity, existing.client_identity, existing.service_name
-      ))
-    }
-  });
-
-  match takeover_needed {
-    Some(Err(msg)) if msg.contains("already registered") => {
-      info!("{}", msg);
-      return RegisterServiceResult::AlreadyRegistered(msg);
-    }
-    Some(Err(msg)) => {
-      return RegisterServiceResult::UnSolicited(msg);
-    }
-    Some(Ok(true)) => {
       info!("Port {} owned by stale connection, taking over for {}", def.remote_port, client_identity);
       if let Some((_, old_binding)) = registry.remove(&def.remote_port) {
         debug!(
           "cancelling listener for port {} (client={}, service={})",
           def.remote_port, old_binding.client_identity, old_binding.service_name
         );
-        old_binding.runtime_handle.abort();
+        old_binding.cancel.cancel();
       }
+    } else {
+      return RegisterServiceResult::UnSolicited(format!(
+        "port {} conflict: requested by {} but owned by {} (service: {})",
+        def.remote_port, client_identity, existing.client_identity, existing.service_name
+      ));
     }
-    _ => {}
   }
 
   match create_tcp_listener_with_retry(def, 3).await {
@@ -201,7 +198,6 @@ async fn create_tcp_listener_with_retry(service: &ServiceDefinition, max_retries
     socket.set_tcp_nodelay(true)?;
     socket.set_nonblocking(true)?;
     socket.set_reuse_address(true)?;
-    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     let bin = bind_addr.parse::<std::net::SocketAddr>()?;
     socket.bind(&bin.into())?;
     socket.listen(128)?;
@@ -229,24 +225,43 @@ async fn create_tcp_listener_with_retry(service: &ServiceDefinition, max_retries
   Err(anyhow::anyhow!("failed to bind {} after {} attempts: {}", bind_addr, max_retries + 1, last_error.unwrap()))
 }
 
-async fn accept_tcp_connections(conn: &Connection, listener: TcpListener, service: &ServiceDefinition) {
+async fn accept_tcp_connections(
+  conn: &Connection,
+  listener: TcpListener,
+  service: &ServiceDefinition,
+  cancel: CancellationToken,
+) {
   let port = service.remote_port;
   info!("accepting TCP connections on port {} for service '{}'", port, service.name);
 
   loop {
-    match listener.accept().await {
-      Ok((tcp_stream, peer_addr)) => {
-        debug!("accepted TCP connection on port {} from {}", port, peer_addr);
-        let conn_clone = conn.clone();
-        tokio::spawn(async move {
-          if let Err(e) = handle_tcp_connection(conn_clone, tcp_stream, port, peer_addr).await {
-            warn!("TCP connection handler error for {}: {}", peer_addr, e);
-          }
-        });
+    tokio::select! {
+      biased;
+      _ = cancel.cancelled() => {
+        debug!("listener for port {} cancelled, releasing", port);
+        break;
       }
-      Err(e) => {
-        warn!("TCP accept error on port {}: {}", port, e);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+      accept_result = listener.accept() => {
+        match accept_result {
+          Ok((tcp_stream, peer_addr)) => {
+            debug!("accepted TCP connection on port {} from {}", port, peer_addr);
+            let conn_clone = conn.clone();
+            let compression = service.compression.unwrap_or_default();
+            let conn_cancel = cancel.child_token();
+
+            tokio::spawn(async move {
+              if let Err(e) =
+                handle_tcp_connection(conn_clone, tcp_stream, port, peer_addr, compression, conn_cancel).await
+              {
+                warn!("TCP connection handler error for {}: {}", peer_addr, e);
+              }
+            });
+          }
+          Err(e) => {
+            warn!("TCP accept error on port {}: {}", port, e);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+          }
+        }
       }
     }
   }
@@ -257,16 +272,31 @@ async fn handle_tcp_connection(
   tcp_stream: TcpStream,
   port: u16,
   peer_addr: SocketAddr,
+  compression: bool,
+  cancel: CancellationToken,
 ) -> anyhow::Result<()> {
   debug!("opening QUIC stream for TCP peer {}", peer_addr);
-  let (mut quic_send, mut quic_recv) =
-    conn.open_bi().await.map_err(|e| anyhow::anyhow!("failed to open QUIC stream: {}", e))?;
+  let (mut quic_send, mut quic_recv) = tokio::select! {
+    biased;
+    _ = cancel.cancelled() => return Ok(()),
+    res = conn.open_bi() => res.map_err(|e| anyhow::anyhow!("failed to open QUIC stream: {}", e))?,
+  };
   debug!("opened QUIC stream for TCP peer {}", peer_addr);
 
   // Write port header
   quic_send.write_all(&port.to_be_bytes()).await.map_err(|e| anyhow::anyhow!("failed to write port header: {}", e))?;
 
-  proxy_tcp_to_quic(tcp_stream, &mut quic_send, &mut quic_recv).await?;
+  tokio::select! {
+    biased;
+    _ = cancel.cancelled() => {
+      debug!("TCP connection {} cancelled mid-proxy", peer_addr);
+      let _ = quic_send.reset(VarInt::from_u32(0));
+      let _ = quic_recv.stop(VarInt::from_u32(0));
+    }
+    res = proxy_tcp_to_quic(tcp_stream, &mut quic_send, &mut quic_recv, compression) => {
+      res?;
+    }
+  }
   debug!("TCP connection {} closed", peer_addr);
   Ok(())
 }
@@ -275,31 +305,43 @@ async fn proxy_tcp_to_quic(
   mut tcp: TcpStream,
   quic_send: &mut SendStream,
   quic_recv: &mut RecvStream,
+  compression: bool,
 ) -> anyhow::Result<()> {
+  use tokio::io::AsyncWriteExt;
   let (mut tcp_r, mut tcp_w) = tcp.split();
 
   let upstream = async {
-    let result = copy(&mut tcp_r, quic_send).await;
-    let _ = quic_send.finish(); // Ignore finish errors
-    result
+    if compression {
+      let mut snappy_send = tokio_snappy::SnappyIO::new(quic_send);
+      let result = copy(&mut tcp_r, &mut snappy_send).await;
+      let _ = snappy_send.into_inner().finish();
+      result
+    } else {
+      let result = copy(&mut tcp_r, quic_send).await;
+      let _ = quic_send.finish();
+      result
+    }
   };
 
-  let downstream = async { copy(quic_recv, &mut tcp_w).await };
+  let downstream = async {
+    let res = if compression {
+      let mut snappy_recv = tokio_snappy::SnappyIO::new(quic_recv);
+      copy(&mut snappy_recv, &mut tcp_w).await
+    } else {
+      copy(quic_recv, &mut tcp_w).await
+    };
+    let _ = tcp_w.shutdown().await;
+    res
+  };
 
-  let upstream = std::pin::pin!(upstream);
-  let downstream = std::pin::pin!(downstream);
+  trace!("compression {compression}");
 
-  match select(upstream, downstream).await {
-    Either::Left((res, _)) => {
-      if let Err(e) = res {
-        debug!("upstream (TCP->QUIC) {}", e);
-      }
-    }
-    Either::Right((res, _)) => {
-      if let Err(e) = res {
-        debug!("downstream (QUIC->TCP) error: {}", e);
-      }
-    }
+  let (up, down) = tokio::join!(upstream, downstream);
+  if let Err(e) = up {
+    debug!("upstream (TCP->QUIC) {}", e);
+  }
+  if let Err(e) = down {
+    debug!("downstream (QUIC->TCP) error: {}", e);
   }
 
   Ok(())
@@ -347,7 +389,7 @@ fn remove_port(port: u16, registry: &PortRegistry, client: &ClientIdentity) -> b
 
   if owns_port {
     if let Some((_, binding)) = registry.remove(&port) {
-      binding.runtime_handle.abort();
+      binding.cancel.cancel();
       debug!("cleaned up port {} (service: {})", port, binding.service_name);
       return true;
     }
@@ -372,7 +414,6 @@ fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
 fn create_udp_socket(bind_addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
   let socket = Socket::new(Domain::for_address(bind_addr), Type::DGRAM, Some(Protocol::UDP))?;
   socket.set_nonblocking(true)?;
-  socket.set_keepalive(true)?;
 
   #[cfg(target_os = "linux")]
   configure_linux_socket(&socket);
@@ -439,7 +480,7 @@ fn configure_linux_socket(socket: &Socket) {
 struct PortBinding {
   client_identity: ClientIdentity,
   service_name: Box<str>,
-  runtime_handle: JoinHandle<()>,
+  cancel: CancellationToken,
 }
 
 #[derive(Clone, Debug)]
