@@ -21,7 +21,7 @@ use quinn::{
   Connection, Endpoint, IdleTimeout, RecvStream, SendStream, TransportConfig, VarInt, congestion,
   crypto::rustls::QuicClientConfig,
 };
-use tokio::{io::copy, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
@@ -29,6 +29,7 @@ use crate::{
   backoff::ExponentialBackoff,
   config::{Config, ServiceDefinition},
   protocol::{ClientControlMessage, ClientHello, ServerAckMessage, read_frame, read_stream_header, write_frame},
+  proxy::proxy,
   tls::{self, TlsClientCertConfig},
 };
 
@@ -507,51 +508,8 @@ async fn handle_data_stream(
   sock_ref.set_tcp_keepalive(&keepalive)?;
   debug!("connected to local service: {}", local_addr);
 
-  proxy_quic_to_tcp(local_tcp, quic_send, quic_recv, compression).await;
+  proxy(local_tcp, quic_send, quic_recv, compression).await;
   Ok(())
-}
-
-async fn proxy_quic_to_tcp(
-  mut tcp: tokio::net::TcpStream,
-  quic_send: &mut SendStream,
-  quic_recv: &mut RecvStream,
-  compression: bool,
-) {
-  use tokio::io::AsyncWriteExt;
-  let (mut tcp_r, mut tcp_w) = tcp.split();
-  let upstream = async {
-    if compression {
-      let mut snappy_send = tokio_snappy::SnappyIO::new(quic_send);
-      let res = copy(&mut tcp_r, &mut snappy_send).await;
-      let _ = snappy_send.into_inner().finish();
-      res
-    } else {
-      let res = copy(&mut tcp_r, quic_send).await;
-      let _ = quic_send.finish();
-      res
-    }
-  };
-
-  let downstream = async {
-    let res = if compression {
-      let mut snappy_recv = tokio_snappy::SnappyIO::new(quic_recv);
-      copy(&mut snappy_recv, &mut tcp_w).await
-    } else {
-      copy(quic_recv, &mut tcp_w).await
-    };
-    let _ = tcp_w.shutdown().await;
-    res
-  };
-
-  trace!("compression {compression}");
-
-  let (up, down) = tokio::join!(upstream, downstream);
-  if let Err(e) = up {
-    debug!("upstream (Local->QUIC) error: {}", e);
-  }
-  if let Err(e) = down {
-    debug!("downstream (QUIC->Local) error: {}", e);
-  }
 }
 
 #[cfg(test)]

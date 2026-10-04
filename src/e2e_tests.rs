@@ -262,3 +262,35 @@ async fn restarted_client_reclaims_port_via_retry() {
   let _ = std::fs::remove_file(&path_a);
   let _ = std::fs::remove_file(&path_b);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn bench_throughput() {
+  let echo = spawn_echo().await;
+  let server_port = free_udp_port();
+  let (plain_port, snappy_port) = (free_tcp_port(), free_tcp_port());
+  let services = [
+    Service { name: "plain", local_addr: echo, remote_port: plain_port, compression: false },
+    Service { name: "snappy", local_addr: echo, remote_port: snappy_port, compression: true },
+  ];
+  let path = temp_config_path();
+  std::fs::write(&path, client_config_toml(server_port, None, &services)).unwrap();
+  let _server = start_server(server_port, None);
+  let _client = start_client(&path);
+  roundtrip_eventually(plain_port, b"x").await;
+  roundtrip_eventually(snappy_port, b"x").await;
+  // 128 MiB, mildly compressible (like typical mixed traffic)
+  let chunk = payload();
+  let data: Vec<u8> = chunk.iter().cycle().take(128 << 20).copied().collect();
+  for (name, port) in [("plain", plain_port), ("snappy", snappy_port)] {
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+      let t = Instant::now();
+      let out = roundtrip(port, &data).await.unwrap();
+      assert_eq!(out.len(), data.len());
+      best = best.min(t.elapsed().as_secs_f64());
+    }
+    // echo => bytes cross the tunnel twice
+    eprintln!("BENCH {name}: {:.0} MiB/s", 2.0 * 128.0 / best);
+  }
+}

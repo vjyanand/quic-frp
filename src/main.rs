@@ -5,6 +5,7 @@ mod config;
 #[cfg(test)]
 mod e2e_tests;
 mod protocol;
+mod proxy;
 mod server;
 mod tls;
 

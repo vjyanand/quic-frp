@@ -1,4 +1,5 @@
 use crate::protocol::{ServerAckMessage, StreamHeader, constant_time_eq, write_frame, write_stream_header};
+use crate::proxy::proxy;
 use crate::{
   config::ServiceDefinition,
   protocol::{ClientControlMessage, ClientHello, read_frame},
@@ -6,15 +7,14 @@ use crate::{
 };
 use dashmap::DashMap;
 use quinn::{
-  Connection, Endpoint, EndpointConfig, IdleTimeout, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
+  Connection, Endpoint, EndpointConfig, IdleTimeout, SendStream, ServerConfig, TransportConfig, VarInt,
   crypto::rustls::QuicServerConfig, default_runtime,
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::io::copy;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 type PortRegistry = Arc<DashMap<u16, PortBinding>>;
 
@@ -358,57 +358,9 @@ async fn handle_tcp_connection(
       let _ = quic_send.reset(VarInt::from_u32(0));
       let _ = quic_recv.stop(VarInt::from_u32(0));
     }
-    res = proxy_tcp_to_quic(tcp_stream, &mut quic_send, &mut quic_recv, compression) => {
-      res?;
-    }
+    _ = proxy(tcp_stream, &mut quic_send, &mut quic_recv, compression) => {}
   }
   debug!("TCP connection {} closed", peer_addr);
-  Ok(())
-}
-
-async fn proxy_tcp_to_quic(
-  mut tcp: TcpStream,
-  quic_send: &mut SendStream,
-  quic_recv: &mut RecvStream,
-  compression: bool,
-) -> anyhow::Result<()> {
-  use tokio::io::AsyncWriteExt;
-  let (mut tcp_r, mut tcp_w) = tcp.split();
-
-  let upstream = async {
-    if compression {
-      let mut snappy_send = tokio_snappy::SnappyIO::new(quic_send);
-      let result = copy(&mut tcp_r, &mut snappy_send).await;
-      let _ = snappy_send.into_inner().finish();
-      result
-    } else {
-      let result = copy(&mut tcp_r, quic_send).await;
-      let _ = quic_send.finish();
-      result
-    }
-  };
-
-  let downstream = async {
-    let res = if compression {
-      let mut snappy_recv = tokio_snappy::SnappyIO::new(quic_recv);
-      copy(&mut snappy_recv, &mut tcp_w).await
-    } else {
-      copy(quic_recv, &mut tcp_w).await
-    };
-    let _ = tcp_w.shutdown().await;
-    res
-  };
-
-  trace!("compression {compression}");
-
-  let (up, down) = tokio::join!(upstream, downstream);
-  if let Err(e) = up {
-    debug!("upstream (TCP->QUIC) {}", e);
-  }
-  if let Err(e) = down {
-    debug!("downstream (QUIC->TCP) error: {}", e);
-  }
-
   Ok(())
 }
 
