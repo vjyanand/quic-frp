@@ -20,6 +20,8 @@ pub struct ServiceDefinition {
 pub struct ClientConfig {
   pub prefer_ipv6: Option<bool>,
   pub remote_addr: String,
+  /// TLS server name to verify the server certificate against. Defaults to the host of `remote_addr`.
+  pub server_name: Option<String>,
   pub retry_interval: Option<u64>,
   pub services: Vec<ServiceDefinition>,
   pub token: Option<String>,

@@ -86,11 +86,13 @@ fn generate_self_signed(san: &[String]) -> anyhow::Result<(Vec<CertificateDer<'s
   Ok((vec![cert_der], key_der))
 }
 
-pub fn alpn(token: &Option<String>) -> String {
-  match token {
-    Some(token) => format!("quic-proxy-{}-{}", VERSION_MAJOR, token.clone()),
-    None => format!("quic-proxy-{}", VERSION_MAJOR),
-  }
+/// Wire protocol revision. Bump on any incompatible framing change so mismatched
+/// peers fail at the handshake instead of mid-stream.
+/// 2: token moved from ALPN into `ClientHello`; data stream header carries compression flag.
+const PROTOCOL_REVISION: u8 = 2;
+
+pub fn alpn() -> String {
+  format!("quic-proxy-{}-r{}", VERSION_MAJOR, PROTOCOL_REVISION)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -24,7 +24,7 @@ use tracing::{debug, info, trace, warn};
 use crate::{
   backoff::ExponentialBackoff,
   config::{Config, ServiceDefinition},
-  protocol::{ClientControlMessage, ServerAckMessage, read_frame, read_port_header, write_frame},
+  protocol::{ClientControlMessage, ClientHello, ServerAckMessage, read_frame, read_stream_header, write_frame},
   tls::{self, TlsClientCertConfig},
 };
 
@@ -37,8 +37,14 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
   let retry_secs = config.retry_interval.unwrap_or(5);
   let mut backoff = ExponentialBackoff::new(Duration::from_secs(retry_secs), Duration::from_secs(30));
 
-  let alpn = tls::alpn(&config.token);
+  let alpn = tls::alpn();
   let (server_addr, local_bind) = resolve_server_addr(&config)?;
+  let server_name = match &config.server_name {
+    Some(name) => name.clone(),
+    None => host_from_addr(&config.remote_addr).to_string(),
+  };
+  debug!("TLS server name: {}", server_name);
+  let hello = ClientHello { token: config.token };
 
   // Pre-allocate with expected capacity
   let services = DashMap::with_capacity(config.services.len());
@@ -59,12 +65,12 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
   });
 
   loop {
-    match connect_to_server(server_addr, local_bind, &alpn, tls_config.clone()).await {
+    match connect_to_server(server_addr, local_bind, &server_name, &alpn, tls_config.clone()).await {
       Ok(conn) => {
         info!("connected to server");
         let session_start = Instant::now();
 
-        let outcome = handle_connection(conn, &services, config_path, shutdown.clone()).await;
+        let outcome = handle_connection(conn, &hello, &services, config_path, shutdown.clone()).await;
 
         if session_start.elapsed() >= HEALTHY_SESSION_THRESHOLD {
           backoff.reset();
@@ -146,12 +152,19 @@ fn resolve_server_addr(config: &crate::config::ClientConfig) -> anyhow::Result<(
   Ok((chosen, local_bind))
 }
 
+/// Host part of a `host:port` / `[v6]:port` address, used as the TLS server name.
+fn host_from_addr(addr: &str) -> &str {
+  let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+  host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
+}
+
 fn create_transport_config() -> anyhow::Result<TransportConfig> {
   let mut transport = TransportConfig::default();
 
   transport.keep_alive_interval(Some(Duration::from_secs(5)));
   transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(10))?));
-  transport.max_concurrent_bidi_streams(VarInt::from_u64(100)?); // Increased from 10
+  // Limits streams the *server* may open to us: one per proxied TCP connection.
+  transport.max_concurrent_bidi_streams(VarInt::from_u32(1024));
   transport.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()));
   // Flow control tuning for better throughput
   transport.send_window(4 * 1024 * 1024); // 4MB send window
@@ -167,6 +180,7 @@ fn create_transport_config() -> anyhow::Result<TransportConfig> {
 async fn connect_to_server(
   server_addr: SocketAddr,
   local_bind: SocketAddr,
+  server_name: &str,
   alpn: &str,
   tls: TlsClientCertConfig,
 ) -> anyhow::Result<Connection> {
@@ -182,31 +196,32 @@ async fn connect_to_server(
   let endpoint = Endpoint::client(local_bind)?;
   debug!("end point created");
 
-  let connection = endpoint.connect_with(client_config, server_addr, "localhost")?.await?;
+  let connection = endpoint.connect_with(client_config, server_addr, server_name)?.await?;
   Ok(connection)
 }
 
 async fn handle_connection(
   conn: Connection,
+  hello: &ClientHello,
   services: &ServiceRegistry,
   config_path: &str,
   shutdown_token: CancellationToken,
 ) -> anyhow::Result<LoopControl> {
+  let (reload_tx, reload_rx) = std::sync::mpsc::channel();
+  let _watcher = setup_config_watcher(config_path, reload_tx)?;
+
   let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
   debug!("control stream opened");
 
+  write_frame(&mut ctrl_send, hello).await?;
   register_services(&mut ctrl_send, services).await?;
 
-  let services_ref = Arc::clone(services);
-  let accept_task = tokio::spawn(async move { accept_data_streams(conn, services_ref).await });
+  let accept_task = tokio::spawn(accept_data_streams(conn.clone(), Arc::clone(services)));
 
   let quic_ctrl_task = tokio::spawn(async move {
     receive_control_messages(&mut ctrl_recv).await;
     true
   });
-
-  let (reload_tx, reload_rx) = std::sync::mpsc::channel();
-  let _watcher = setup_config_watcher(config_path, reload_tx)?;
 
   let result = event_loop_with_connection_monitor(
     &mut ctrl_send,
@@ -226,6 +241,10 @@ async fn handle_connection(
   let _ = ctrl_send.finish();
 
   accept_task.abort();
+
+  if let Some(reason) = conn.close_reason() {
+    warn!("connection closed: {}", reason);
+  }
 
   result
 }
@@ -316,15 +335,22 @@ async fn handle_config_reload(
     }
   }
 
-  // Register or update services
+  // Register or update services. Clone the current entry out so no DashMap guard
+  // is held across the awaits below.
   for svc in new_config.services {
-    match services.get_mut(&svc.remote_port) {
-      Some(mut entry) => {
-        // Update existing service if local_addr changed
-        if entry.local_addr != svc.local_addr || entry.compression != svc.compression {
-          info!("updating service {} local_addr: {} -> {}", svc.name, entry.local_addr, svc.local_addr);
-          *entry = svc;
-        }
+    let current = services.get(&svc.remote_port).map(|entry| entry.clone());
+    match current {
+      Some(current) if current == svc => {}
+      Some(current) if needs_reregister(&current, &svc) => {
+        // Server-side settings changed: the server must rebind with the new definition.
+        info!("re-registering changed service: {}", svc.name);
+        write_frame(ctrl_send, &ClientControlMessage::DeregisterService(current)).await?;
+        write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc.clone())).await?;
+        services.insert(svc.remote_port, svc);
+      }
+      Some(current) => {
+        info!("updating service {} local_addr: {} -> {}", svc.name, current.local_addr, svc.local_addr);
+        services.insert(svc.remote_port, svc);
       }
       None => {
         // Register new service
@@ -337,6 +363,12 @@ async fn handle_config_reload(
 
   debug!("updated services list - {:?}", services);
   Ok(())
+}
+
+/// Whether a change touches fields the server acts on (as opposed to `local_addr`,
+/// which only the client uses).
+fn needs_reregister(current: &ServiceDefinition, new: &ServiceDefinition) -> bool {
+  current.name != new.name || current.compression != new.compression || current.prefer_ipv6 != new.prefer_ipv6
 }
 
 async fn register_services(ctrl_send: &mut SendStream, services: &ServiceRegistry) -> anyhow::Result<()> {
@@ -417,14 +449,16 @@ async fn handle_data_stream(
   quic_recv: &mut RecvStream,
   services: &ServiceRegistry,
 ) -> anyhow::Result<()> {
-  let port = read_port_header(quic_recv).await?;
+  let header = read_stream_header(quic_recv).await?;
+  let port = header.port;
+  // Compression comes from the stream header, not local config, so a reload that is
+  // still propagating to the server cannot desync the two ends.
+  let compression = header.compression;
 
-  // Direct lookup by port instead of iteration
   let service = services.get(&port).ok_or_else(|| anyhow::anyhow!("no service configured for port {}", port))?;
 
   let local_addr = service.local_addr.clone();
   let service_name = service.name.clone();
-  let compression = service.compression.unwrap_or_default();
 
   drop(service); // Release lock before async operations
 
@@ -482,14 +516,41 @@ async fn proxy_quic_to_tcp(
 
   trace!("compression {compression}");
 
-  match tokio::join!(upstream, downstream) {
-    (up, down) => {
-      if let Err(e) = up {
-        debug!("upstream (Local->QUIC) error: {}", e);
-      }
-      if let Err(e) = down {
-        debug!("downstream (QUIC->Local) error: {}", e);
-      }
-    }
+  let (up, down) = tokio::join!(upstream, downstream);
+  if let Err(e) = up {
+    debug!("upstream (Local->QUIC) error: {}", e);
+  }
+  if let Err(e) = down {
+    debug!("downstream (QUIC->Local) error: {}", e);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn host_from_addr_strips_port_and_brackets() {
+    assert_eq!(host_from_addr("example.com:4433"), "example.com");
+    assert_eq!(host_from_addr("203.0.113.7:4433"), "203.0.113.7");
+    assert_eq!(host_from_addr("[2001:db8::1]:4433"), "2001:db8::1");
+    assert_eq!(host_from_addr("example.com"), "example.com");
+  }
+
+  #[test]
+  fn reregister_only_for_server_side_changes() {
+    let base = ServiceDefinition {
+      local_addr: "127.0.0.1:80".into(),
+      name: "web".into(),
+      remote_port: 8080,
+      prefer_ipv6: None,
+      compression: None,
+    };
+    let local_only = ServiceDefinition { local_addr: "127.0.0.1:81".into(), ..base.clone() };
+    let compression = ServiceDefinition { compression: Some(true), ..base.clone() };
+    let ipv6 = ServiceDefinition { prefer_ipv6: Some(true), ..base.clone() };
+    assert!(!needs_reregister(&base, &local_only));
+    assert!(needs_reregister(&base, &compression));
+    assert!(needs_reregister(&base, &ipv6));
   }
 }

@@ -8,7 +8,7 @@ anyhow = "1.0.102"
 bitcode = "0.6.9"
 clap = { version = "4.6.1", features = ["derive"] }
 dashmap = "6.1.0"
-hotpath = "0.16.1"
+hotpath = { version = "0.16.1", optional = true }
 notify = "8.2.0"
 quinn = "0.11.9"
 rcgen = "0.14.8"
@@ -35,9 +35,9 @@ tracing-subscriber = { version = "0.3.22", default-features = false, features = 
 uuid = { version = "1.23.0", features = ["v4"] }
 
 [features]
-hotpath = ["hotpath/hotpath"]
-hotpath-cpu = ["hotpath/hotpath-cpu"]
-hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-cpu = ["dep:hotpath", "hotpath/hotpath-cpu"]
+hotpath-alloc = ["dep:hotpath", "hotpath/hotpath-alloc"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.180"

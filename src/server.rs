@@ -1,7 +1,7 @@
-use crate::protocol::{ServerAckMessage, write_frame};
+use crate::protocol::{ServerAckMessage, StreamHeader, constant_time_eq, write_frame, write_stream_header};
 use crate::{
   config::ServiceDefinition,
-  protocol::{ClientControlMessage, read_frame},
+  protocol::{ClientControlMessage, ClientHello, read_frame},
   tls::{self, TlsServerCertConfig},
 };
 use dashmap::DashMap;
@@ -18,6 +18,11 @@ use tracing::{debug, info, trace, warn};
 
 type PortRegistry = Arc<DashMap<u16, PortBinding>>;
 
+/// How long a new connection has to send its `ClientHello`.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// QUIC application close code sent when the client fails authentication.
+const CLOSE_UNAUTHORIZED: u32 = 0x401;
+
 pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<()> {
   info!("server starting on {}", config.listen_addr);
 
@@ -26,7 +31,7 @@ pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<(
     _ => TlsServerCertConfig::self_signed(vec!["localhost"]).into_server_config()?,
   };
 
-  let alpn = tls::alpn(&config.token);
+  let alpn = tls::alpn();
   server_crypto.alpn_protocols = vec![alpn.into()];
   let server_crypto = Arc::new(QuicServerConfig::try_from(server_crypto)?);
 
@@ -42,6 +47,7 @@ pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<(
   info!("server listening on {}", endpoint.local_addr()?);
 
   let registry: PortRegistry = Arc::new(DashMap::with_capacity(10));
+  let token: Arc<Option<String>> = Arc::new(config.token);
 
   loop {
     let Some(incoming) = endpoint.accept().await else {
@@ -50,8 +56,9 @@ pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<(
     };
 
     let registry = Arc::clone(&registry);
+    let token = Arc::clone(&token);
     tokio::spawn(async move {
-      let result = handle_connection(incoming, registry).await;
+      let result = handle_connection(incoming, registry, &token).await;
       debug!("result: {:?}", result);
     });
   }
@@ -59,7 +66,11 @@ pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<(
   Ok(())
 }
 
-async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) -> anyhow::Result<()> {
+async fn handle_connection(
+  incoming: quinn::Incoming,
+  registry: PortRegistry,
+  token: &Option<String>,
+) -> anyhow::Result<()> {
   let connection = incoming.await?;
   let remote_address = connection.remote_address();
   debug!("new incoming connection from {} with id {}", remote_address, connection.stable_id());
@@ -69,6 +80,15 @@ async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) ->
 
   let (mut control_send, mut control_recv) = connection.accept_bi().await?; // Control Stream from client
   debug!("control stream established for {}", client_identity);
+
+  let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<ClientHello, _>(&mut control_recv))
+    .await
+    .map_err(|_| anyhow::anyhow!("client {} did not send hello within {:?}", client_identity, HELLO_TIMEOUT))??;
+  if !is_authorized(token, &hello.token) {
+    warn!("rejecting {}: invalid token", client_identity);
+    connection.close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"unauthorized");
+    return Err(anyhow::anyhow!("client {} failed authentication", client_identity));
+  }
 
   let loop_result: anyhow::Result<()> = async {
     loop {
@@ -98,6 +118,14 @@ async fn handle_connection(incoming: quinn::Incoming, registry: PortRegistry) ->
 
   cleanup_listeners(&registry, &client_identity);
   loop_result
+}
+
+fn is_authorized(expected: &Option<String>, presented: &Option<String>) -> bool {
+  match (expected, presented) {
+    (None, _) => true,
+    (Some(expected), Some(presented)) => constant_time_eq(expected.as_bytes(), presented.as_bytes()),
+    (Some(_), None) => false,
+  }
 }
 
 async fn handle_register_service(
@@ -147,14 +175,27 @@ async fn register_service(
 ) -> RegisterServiceResult {
   debug!("registerService: {:?} from {}", def, client_identity);
 
-  // Check existing registration - minimize lock duration
-  if let Some(existing) = registry.get(&def.remote_port) {
+  // Classify any existing owner, then release the shard read lock before mutating:
+  // calling `registry.remove` while a `registry.get` guard on the same key is alive deadlocks.
+  let existing = registry.get(&def.remote_port).map(|existing| {
     if client_identity == &existing.client_identity {
+      ExistingOwner::SameConnection
+    } else if client_identity.is_same_client(&existing.client_identity) {
+      ExistingOwner::StaleConnection
+    } else {
+      ExistingOwner::Other(format!("{} (service: {})", existing.client_identity, existing.service_name))
+    }
+  });
+
+  match existing {
+    None => {}
+    Some(ExistingOwner::SameConnection) => {
       return RegisterServiceResult::AlreadyRegistered(format!(
         "port {} already registered by this connection {}",
         def.remote_port, client_identity
       ));
-    } else if client_identity.is_same_client(&existing.client_identity) {
+    }
+    Some(ExistingOwner::StaleConnection) => {
       info!("Port {} owned by stale connection, taking over for {}", def.remote_port, client_identity);
       if let Some((_, old_binding)) = registry.remove(&def.remote_port) {
         debug!(
@@ -163,10 +204,11 @@ async fn register_service(
         );
         old_binding.cancel.cancel();
       }
-    } else {
+    }
+    Some(ExistingOwner::Other(owner)) => {
       return RegisterServiceResult::UnSolicited(format!(
-        "port {} conflict: requested by {} but owned by {} (service: {})",
-        def.remote_port, client_identity, existing.client_identity, existing.service_name
+        "port {} conflict: requested by {} but owned by {}",
+        def.remote_port, client_identity, owner
       ));
     }
   }
@@ -193,17 +235,12 @@ async fn create_tcp_listener_with_retry(service: &ServiceDefinition, max_retries
     false => (Domain::IPV4, format!("0.0.0.0:{}", service.remote_port)),
   };
 
-  for attempt in 0..=max_retries {
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_tcp_nodelay(true)?;
-    socket.set_nonblocking(true)?;
-    socket.set_reuse_address(true)?;
-    let bin = bind_addr.parse::<std::net::SocketAddr>()?;
-    socket.bind(&bin.into())?;
-    socket.listen(128)?;
-    let std_listener: std::net::TcpListener = socket.into();
+  let bind_addr: SocketAddr = bind_addr.parse()?;
 
-    match tokio::net::TcpListener::try_from(std_listener) {
+  // Retry the bind itself: on a stale-connection takeover the previous listener is
+  // closed asynchronously by its accept task, so the port may still be held briefly.
+  for attempt in 0..=max_retries {
+    match bind_tcp_listener(domain, bind_addr) {
       Ok(listener) => {
         if attempt > 0 {
           debug!("successfully bound TCP listener on {} after {} retries", bind_addr, attempt);
@@ -223,6 +260,17 @@ async fn create_tcp_listener_with_retry(service: &ServiceDefinition, max_retries
   }
 
   Err(anyhow::anyhow!("failed to bind {} after {} attempts: {}", bind_addr, max_retries + 1, last_error.unwrap()))
+}
+
+fn bind_tcp_listener(domain: Domain, bind_addr: SocketAddr) -> std::io::Result<TcpListener> {
+  let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+  socket.set_tcp_nodelay(true)?;
+  socket.set_nonblocking(true)?;
+  socket.set_reuse_address(true)?;
+  socket.bind(&bind_addr.into())?;
+  socket.listen(128)?;
+  let std_listener: std::net::TcpListener = socket.into();
+  TcpListener::from_std(std_listener)
 }
 
 async fn accept_tcp_connections(
@@ -283,8 +331,9 @@ async fn handle_tcp_connection(
   };
   debug!("opened QUIC stream for TCP peer {}", peer_addr);
 
-  // Write port header
-  quic_send.write_all(&port.to_be_bytes()).await.map_err(|e| anyhow::anyhow!("failed to write port header: {}", e))?;
+  write_stream_header(&mut quic_send, &StreamHeader { port, compression })
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to write stream header: {}", e))?;
 
   tokio::select! {
     biased;
@@ -406,7 +455,8 @@ fn create_transport_config() -> anyhow::Result<Arc<TransportConfig>> {
   let mut transport = TransportConfig::default();
   transport.keep_alive_interval(Some(Duration::from_secs(5)));
   transport.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(20))?));
-  transport.max_concurrent_bidi_streams(VarInt::from_u64(500)?);
+  // Limits streams the *client* may open; it only ever opens the control stream.
+  transport.max_concurrent_bidi_streams(VarInt::from_u32(4));
   transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
   Ok(Arc::new(transport))
 }
@@ -524,9 +574,107 @@ impl std::fmt::Display for ClientIdentity {
   }
 }
 
+enum ExistingOwner {
+  SameConnection,
+  StaleConnection,
+  Other(String),
+}
+
 enum RegisterServiceResult {
   Registered(TcpListener),
   AlreadyRegistered(String),
   UnSolicited(String),
   OsError(String),
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn service(port: u16) -> ServiceDefinition {
+    ServiceDefinition {
+      local_addr: "127.0.0.1:1".into(),
+      name: "svc".into(),
+      remote_port: port,
+      prefer_ipv6: None,
+      compression: None,
+    }
+  }
+
+  fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port()
+  }
+
+  /// Bind `def` for `owner` and hold the listener until the binding is cancelled,
+  /// like `accept_tcp_connections` does.
+  async fn bind_for(def: &ServiceDefinition, owner: &ClientIdentity, registry: &PortRegistry) {
+    let RegisterServiceResult::Registered(listener) = register_service(def, owner, registry).await else {
+      panic!("initial registration failed");
+    };
+    let cancel = CancellationToken::new();
+    let held = cancel.clone();
+    tokio::spawn(async move {
+      held.cancelled().await;
+      drop(listener);
+    });
+    let binding = PortBinding { client_identity: owner.clone(), service_name: def.name.clone().into(), cancel };
+    registry.insert(def.remote_port, binding);
+  }
+
+  /// A DashMap deadlock blocks the thread outright, so `tokio::time::timeout` cannot catch it.
+  /// Run on a separate OS thread and bound the wait from outside.
+  fn run_with_deadline<F: std::future::Future<Output = ()> + Send + 'static>(fut: F) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+      tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(fut);
+      let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(10)).expect("test hung (deadlock?)");
+  }
+
+  #[test]
+  fn stale_connection_takeover_rebinds_port() {
+    run_with_deadline(async {
+      let registry: PortRegistry = Arc::new(DashMap::new());
+      let def = service(free_tcp_port());
+      let addr: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+      let stale = ClientIdentity::from(addr);
+      bind_for(&def, &stale, &registry).await;
+
+      // Reconnect from the same IP while the old listener is still open: must not deadlock,
+      // and must retry the bind until the old listener is released.
+      let fresh = ClientIdentity::from(addr);
+      let result = register_service(&def, &fresh, &registry).await;
+      assert!(matches!(result, RegisterServiceResult::Registered(_)));
+      assert!(!registry.contains_key(&def.remote_port), "stale binding should have been removed");
+    });
+  }
+
+  #[test]
+  fn conflicting_registrations_rejected() {
+    run_with_deadline(async {
+      let registry: PortRegistry = Arc::new(DashMap::new());
+      let def = service(free_tcp_port());
+      let owner = ClientIdentity::from("203.0.113.7:5000".parse::<SocketAddr>().unwrap());
+      bind_for(&def, &owner, &registry).await;
+
+      let result = register_service(&def, &owner, &registry).await;
+      assert!(matches!(result, RegisterServiceResult::AlreadyRegistered(_)));
+
+      let other = ClientIdentity::from("198.51.100.9:5000".parse::<SocketAddr>().unwrap());
+      let result = register_service(&def, &other, &registry).await;
+      assert!(matches!(result, RegisterServiceResult::UnSolicited(_)));
+      assert!(registry.contains_key(&def.remote_port), "owner's binding must survive a conflicting request");
+    });
+  }
+
+  #[test]
+  fn token_authorization() {
+    let expected = Some("secret".to_string());
+    assert!(is_authorized(&None, &None));
+    assert!(is_authorized(&None, &Some("anything".into())));
+    assert!(is_authorized(&expected, &Some("secret".into())));
+    assert!(!is_authorized(&expected, &Some("wrong".into())));
+    assert!(!is_authorized(&expected, &None));
+  }
 }

@@ -46,7 +46,8 @@ A fast, lightweight reverse proxy built on QUIC protocol for exposing local serv
 
 - **Control Plane**: Long-lived bidirectional QUIC stream for service registration/unregistration
 - **Data Plane**: New QUIC stream opened for each proxied TCP connection
-- **Framing**: 4-byte length prefix + bitcode payload for control messages, 2-byte port header for data streams
+- **Handshake**: First control frame is a `ClientHello` carrying the auth token (sent inside the encrypted QUIC connection, never in the TLS ClientHello)
+- **Framing**: 2-byte length prefix + bitcode payload for control messages; 3-byte header (port + compression flag) for data streams
 
 ## Installation
 
@@ -212,6 +213,7 @@ Modify `client.toml` while the client is running. Changes are automatically dete
 - **Add service**: New TCP listener opens on server
 - **Remove service**: TCP listener closes on server
 - **Modify local_addr**: Future connections route to new address
+- **Modify compression / prefer_ipv6**: Service is re-registered on the server (open connections on that port are closed)
 
 ## Configuration Reference
 
@@ -229,6 +231,7 @@ Modify `client.toml` while the client is running. Changes are automatically dete
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `remote_addr` | String | Yes | - | Server address (`"host:port"`) |
+| `server_name` | String | No | host of `remote_addr` | Name the server certificate is verified against |
 | `token` | String | No | - | Authentication token (must match server) |
 | `prefer_ipv6` | Boolean | No | `false` | Prefer IPv6 when resolving server address |
 | `retry_interval` | Integer | No | `5` | Initial retry interval in seconds |
@@ -275,7 +278,7 @@ RUST_LOG=trace ./quic-frp -c (client|server).toml
 - **TLS**: QUIC provides built-in TLS 1.3 encryption for all traffic
 - **Authentication**: Use token-based or certificate-based authentication to prevent unauthorized clients
 - **Self-Signed Certificates**: Server generates self-signed certificates by default. For production, use proper certificates via the `cert` and `key` options
-- **Token Security**: Choose a strong, random token and keep it secret. Tokens are transmitted securely over the QUIC connection
+- **Token Security**: Choose a strong, random token and keep it secret. The token is sent after the TLS handshake completes, so it is encrypted on the wire and compared in constant time
 - **Firewall**: Only expose necessary ports on the server (UDP port for QUIC, TCP ports for services)
 - **Network Trust**: Even with authentication, ensure your server is properly secured and monitored
 
