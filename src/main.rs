@@ -1,10 +1,10 @@
-mod backoff;
 mod cli;
 mod client;
 mod config;
-mod protocol;
+#[cfg(test)]
+mod e2e_tests;
 mod server;
-mod tls;
+mod shared;
 
 use clap::Parser;
 use tracing::debug;
@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
   FmtSubscriber::builder()
     .with_env_filter(
       EnvFilter::try_from_default_env()
-        .unwrap_or(EnvFilter::new("debug"))
+        .unwrap_or(EnvFilter::new("info"))
         .add_directive("quinn::connection=warn".parse().unwrap()),
     )
     .with_thread_names(true)
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     .init();
 
   let cli = Cli::try_parse()?;
-  debug!("Using config file {}", cli.config);
+  debug!("using config file {}", cli.config);
   let config = Config::load(&cli.config)?;
   match config {
     Config::Server(server_config) => run_server(server_config).await,
