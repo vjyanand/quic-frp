@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
   FmtSubscriber::builder()
     .with_env_filter(
       EnvFilter::try_from_default_env()
-        .unwrap_or(EnvFilter::new("debug"))
+        .unwrap_or(EnvFilter::new("info"))
         .add_directive("quinn::connection=warn".parse().unwrap()),
     )
     .with_thread_names(true)
