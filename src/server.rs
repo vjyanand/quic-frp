@@ -75,20 +75,20 @@ async fn handle_connection(
   let remote_address = connection.remote_address();
   debug!("new incoming connection from {} with id {}", remote_address, connection.stable_id());
 
-  let client_identity = ClientIdentity::from(remote_address);
-  trace!("new client with identity {}", client_identity);
-
   let (mut control_send, mut control_recv) = connection.accept_bi().await?; // Control Stream from client
-  debug!("control stream established for {}", client_identity);
+  debug!("control stream established for {}", remote_address);
 
   let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<ClientHello, _>(&mut control_recv))
     .await
-    .map_err(|_| anyhow::anyhow!("client {} did not send hello within {:?}", client_identity, HELLO_TIMEOUT))??;
+    .map_err(|_| anyhow::anyhow!("client {} did not send hello within {:?}", remote_address, HELLO_TIMEOUT))??;
   if !is_authorized(token, &hello.token) {
-    warn!("rejecting {}: invalid token", client_identity);
+    warn!("rejecting {}: invalid token", remote_address);
     connection.close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"unauthorized");
-    return Err(anyhow::anyhow!("client {} failed authentication", client_identity));
+    return Err(anyhow::anyhow!("client {} failed authentication", remote_address));
   }
+
+  let client_identity = ClientIdentity::new(remote_address, hello.session_id);
+  debug!("authenticated client {}", client_identity);
 
   let loop_result: anyhow::Result<()> = async {
     loop {
@@ -140,17 +140,33 @@ async fn handle_register_service(
 
   let tcp_listener = match register_service(&def, client_identity, registry).await {
     RegisterServiceResult::Registered(tcp_listener) => tcp_listener,
-    RegisterServiceResult::OsError(msg)
-    | RegisterServiceResult::AlreadyRegistered(msg)
-    | RegisterServiceResult::UnSolicited(msg) => {
-      let ack = ServerAckMessage::ServiceRegistered { service_name, success: false, error: Some(msg) };
+    RegisterServiceResult::AlreadyRegistered(msg) => {
+      // Idempotent: the port is already served for this connection (e.g. a client retry).
+      debug!("{}", msg);
+      let ack =
+        ServerAckMessage::ServiceRegistered { service_name, remote_port: service_port, success: true, error: None };
+      write_frame(control_send, &ack).await?;
+      return Ok(());
+    }
+    RegisterServiceResult::OsError(msg) | RegisterServiceResult::UnSolicited(msg) => {
+      let ack = ServerAckMessage::ServiceRegistered {
+        service_name,
+        remote_port: service_port,
+        success: false,
+        error: Some(msg),
+      };
       write_frame(control_send, &ack).await?;
       return Ok(());
     }
   };
 
   // Send success ACK before spawning listener
-  let ack = ServerAckMessage::ServiceRegistered { service_name: service_name.clone(), success: true, error: None };
+  let ack = ServerAckMessage::ServiceRegistered {
+    service_name: service_name.clone(),
+    remote_port: service_port,
+    success: true,
+    error: None,
+  };
   write_frame(control_send, &ack).await?;
 
   let cancel = CancellationToken::new();
@@ -535,25 +551,28 @@ struct PortBinding {
 
 #[derive(Clone, Debug)]
 struct ClientIdentity {
+  /// For logging only; ownership is decided by `session_id` and `connection_id`.
   remote_ip: std::net::IpAddr,
-  identifier: uuid::Uuid,
+  /// Client-chosen, stable across reconnects of one client process.
+  session_id: u128,
+  /// Unique per QUIC connection.
+  connection_id: uuid::Uuid,
 }
 
-impl From<SocketAddr> for ClientIdentity {
-  fn from(addr: SocketAddr) -> Self {
+impl ClientIdentity {
+  fn new(addr: SocketAddr, session_id: u128) -> Self {
     let remote_ip = match addr.ip() {
       std::net::IpAddr::V6(v6) => {
         v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or_else(|| std::net::IpAddr::V6(v6))
       }
       ip => ip,
     };
-    Self { remote_ip, identifier: uuid::Uuid::new_v4() }
+    Self { remote_ip, session_id, connection_id: uuid::Uuid::new_v4() }
   }
-}
 
-impl ClientIdentity {
+  /// Same client process on a different connection (a reconnect), regardless of source IP.
   fn is_same_client(&self, other: &Self) -> bool {
-    self.remote_ip == other.remote_ip
+    self.session_id == other.session_id
   }
 
   fn get_ports(&self, registry: &PortRegistry) -> Vec<u16> {
@@ -563,14 +582,15 @@ impl ClientIdentity {
 
 impl PartialEq for ClientIdentity {
   fn eq(&self, other: &Self) -> bool {
-    self.remote_ip == other.remote_ip && self.identifier == other.identifier
+    self.session_id == other.session_id && self.connection_id == other.connection_id
   }
 }
 
 impl std::fmt::Display for ClientIdentity {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    let uuid_str = self.identifier.as_hyphenated();
-    write!(f, "{}({:.8})", self.remote_ip, uuid_str)
+    let session = format!("{:032x}", self.session_id);
+    let connection = self.connection_id.as_hyphenated().to_string();
+    write!(f, "{}({:.8}/{:.8})", self.remote_ip, session, connection)
   }
 }
 
@@ -637,13 +657,12 @@ mod tests {
     run_with_deadline(async {
       let registry: PortRegistry = Arc::new(DashMap::new());
       let def = service(free_tcp_port());
-      let addr: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-      let stale = ClientIdentity::from(addr);
+      let stale = ClientIdentity::new("203.0.113.7:5000".parse().unwrap(), 42);
       bind_for(&def, &stale, &registry).await;
 
-      // Reconnect from the same IP while the old listener is still open: must not deadlock,
-      // and must retry the bind until the old listener is released.
-      let fresh = ClientIdentity::from(addr);
+      // Reconnect of the same session (from a new IP) while the old listener is still open:
+      // must not deadlock, and must retry the bind until the old listener is released.
+      let fresh = ClientIdentity::new("198.51.100.9:6000".parse().unwrap(), 42);
       let result = register_service(&def, &fresh, &registry).await;
       assert!(matches!(result, RegisterServiceResult::Registered(_)));
       assert!(!registry.contains_key(&def.remote_port), "stale binding should have been removed");
@@ -655,13 +674,15 @@ mod tests {
     run_with_deadline(async {
       let registry: PortRegistry = Arc::new(DashMap::new());
       let def = service(free_tcp_port());
-      let owner = ClientIdentity::from("203.0.113.7:5000".parse::<SocketAddr>().unwrap());
+      let addr: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+      let owner = ClientIdentity::new(addr, 1);
       bind_for(&def, &owner, &registry).await;
 
       let result = register_service(&def, &owner, &registry).await;
       assert!(matches!(result, RegisterServiceResult::AlreadyRegistered(_)));
 
-      let other = ClientIdentity::from("198.51.100.9:5000".parse::<SocketAddr>().unwrap());
+      // Another client behind the same NAT IP must not be able to take the port.
+      let other = ClientIdentity::new(addr, 2);
       let result = register_service(&def, &other, &registry).await;
       assert!(matches!(result, RegisterServiceResult::UnSolicited(_)));
       assert!(registry.contains_key(&def.remote_port), "owner's binding must survive a conflicting request");

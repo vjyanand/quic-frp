@@ -46,7 +46,7 @@ A fast, lightweight reverse proxy built on QUIC protocol for exposing local serv
 
 - **Control Plane**: Long-lived bidirectional QUIC stream for service registration/unregistration
 - **Data Plane**: New QUIC stream opened for each proxied TCP connection
-- **Handshake**: First control frame is a `ClientHello` carrying the auth token (sent inside the encrypted QUIC connection, never in the TLS ClientHello)
+- **Handshake**: First control frame is a `ClientHello` carrying the auth token (sent inside the encrypted QUIC connection, never in the TLS ClientHello) and a random per-process session id. A reconnect with the same session id takes over its ports from the stale connection; other clients (even from the same IP) are refused, and the client retries rejected registrations every 5s
 - **Framing**: 2-byte length prefix + bitcode payload for control messages; 3-byte header (port + compression flag) for data streams
 
 ## Installation

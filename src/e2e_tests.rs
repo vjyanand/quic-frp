@@ -205,3 +205,60 @@ async fn wrong_token_is_rejected() {
   server.abort();
   let _ = std::fs::remove_file(&path);
 }
+
+/// Local service that answers every connection with `tag`, so tests can tell backends apart.
+async fn spawn_tagged(tag: &'static [u8]) -> SocketAddr {
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let addr = listener.local_addr().unwrap();
+  tokio::spawn(async move {
+    while let Ok((mut stream, _)) = listener.accept().await {
+      tokio::spawn(async move {
+        let _ = stream.write_all(tag).await;
+        let _ = stream.shutdown().await;
+        let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
+      });
+    }
+  });
+  addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_client_reclaims_port_via_retry() {
+  let (backend_a, backend_b) = (spawn_tagged(b"A").await, spawn_tagged(b"B").await);
+  let server_port = free_udp_port();
+  let remote_port = free_tcp_port();
+  let config = |local_addr| {
+    client_config_toml(server_port, None, &[Service { name: "svc", local_addr, remote_port, compression: false }])
+  };
+  let (path_a, path_b) = (temp_config_path(), temp_config_path());
+  std::fs::write(&path_a, config(backend_a)).unwrap();
+  std::fs::write(&path_b, config(backend_b)).unwrap();
+
+  let server = start_server(server_port, None);
+  let client_a = start_client(&path_a);
+  assert_eq!(roundtrip_eventually(remote_port, b"").await, b"A");
+
+  // A second process (new session, same IP) must not take the port while the first is alive.
+  let client_b = start_client(&path_b);
+  tokio::time::sleep(Duration::from_secs(2)).await;
+  assert_eq!(roundtrip(remote_port, b"").await.unwrap(), b"A");
+
+  // Crash the first process. Once the server drops its connection, the second client's
+  // registration retries must win the port.
+  client_a.abort();
+  let deadline = Instant::now() + Duration::from_secs(30);
+  loop {
+    if let Ok(out) = roundtrip(remote_port, b"").await
+      && out == b"B"
+    {
+      break;
+    }
+    assert!(Instant::now() < deadline, "second client never took over the port");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+  }
+
+  client_b.abort();
+  server.abort();
+  let _ = std::fs::remove_file(&path_a);
+  let _ = std::fs::remove_file(&path_b);
+}

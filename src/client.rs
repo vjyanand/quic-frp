@@ -11,6 +11,10 @@ use std::{
 /// accepts the QUIC handshake but the session dies immediately after.
 const HEALTHY_SESSION_THRESHOLD: Duration = Duration::from_secs(30);
 
+/// Delay before re-sending a registration the server rejected. Covers ports still held
+/// by our own previous connection (e.g. after a restart) until the server times it out.
+const REGISTER_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 use dashmap::DashMap;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use quinn::{
@@ -44,7 +48,7 @@ pub async fn run_client(config: crate::config::ClientConfig, config_path: &str) 
     None => host_from_addr(&config.remote_addr).to_string(),
   };
   debug!("TLS server name: {}", server_name);
-  let hello = ClientHello { token: config.token };
+  let hello = ClientHello { token: config.token, session_id: uuid::Uuid::new_v4().as_u128() };
 
   // Pre-allocate with expected capacity
   let services = DashMap::with_capacity(config.services.len());
@@ -218,8 +222,9 @@ async fn handle_connection(
 
   let accept_task = tokio::spawn(accept_data_streams(conn.clone(), Arc::clone(services)));
 
+  let (retry_tx, retry_rx) = tokio::sync::mpsc::unbounded_channel();
   let quic_ctrl_task = tokio::spawn(async move {
-    receive_control_messages(&mut ctrl_recv).await;
+    receive_control_messages(&mut ctrl_recv, retry_tx).await;
     true
   });
 
@@ -228,6 +233,7 @@ async fn handle_connection(
     services,
     config_path,
     reload_rx,
+    retry_rx,
     quic_ctrl_task,
     shutdown_token,
   )
@@ -254,12 +260,29 @@ async fn event_loop_with_connection_monitor(
   services: &ServiceRegistry,
   config_path: &str,
   reload_rx: std::sync::mpsc::Receiver<()>,
+  mut retry_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
   quic_ctrl_task: JoinHandle<bool>,
   shutdown_token: CancellationToken,
 ) -> anyhow::Result<LoopControl> {
   let mut conn_dead = pin!(quic_ctrl_task);
+  let mut pending_retries: Vec<(Instant, u16)> = Vec::new();
 
   loop {
+    while let Ok(port) = retry_rx.try_recv() {
+      if !pending_retries.iter().any(|&(_, p)| p == port) {
+        pending_retries.push((Instant::now() + REGISTER_RETRY_DELAY, port));
+      }
+    }
+    let now = Instant::now();
+    let (due, waiting): (Vec<_>, Vec<_>) = pending_retries.into_iter().partition(|&(at, _)| at <= now);
+    pending_retries = waiting;
+    for (_, port) in due {
+      // Skip services removed by a reload since the failure.
+      let Some(svc) = services.get(&port).map(|svc| svc.clone()) else { continue };
+      debug!("retrying registration of '{}'", svc.name);
+      write_frame(ctrl_send, &ClientControlMessage::RegisterService(svc)).await?;
+    }
+
     // Drain all pending reload signals (coalesce rapid changes)
     let mut reload_pending = false;
     while reload_rx.try_recv().is_ok() {
@@ -383,15 +406,21 @@ async fn register_services(ctrl_send: &mut SendStream, services: &ServiceRegistr
   Ok(())
 }
 
-async fn receive_control_messages(ctrl_recv: &mut RecvStream) {
+async fn receive_control_messages(ctrl_recv: &mut RecvStream, retry_tx: tokio::sync::mpsc::UnboundedSender<u16>) {
   loop {
     match read_frame::<ServerAckMessage, _>(ctrl_recv).await {
       Ok(msg) => match msg {
-        ServerAckMessage::ServiceRegistered { service_name, success, error } => {
+        ServerAckMessage::ServiceRegistered { service_name, remote_port, success, error } => {
           if success {
             info!("service '{}' registered", service_name);
           } else {
-            warn!("service '{}' registration failed: {:?}", service_name, error);
+            warn!(
+              "service '{}' registration failed, retrying in {}s: {}",
+              service_name,
+              REGISTER_RETRY_DELAY.as_secs(),
+              error.unwrap_or_default()
+            );
+            let _ = retry_tx.send(remote_port);
           }
         }
         ServerAckMessage::ServiceUnregistered { service_name, success, .. } => {

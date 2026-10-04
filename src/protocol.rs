@@ -10,6 +10,9 @@ const MAX_FRAME_LEN: usize = u16::MAX as usize;
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 pub struct ClientHello {
   pub token: Option<String>,
+  /// Random per-process id. Lets the server hand a port over from a stale connection
+  /// to a reconnect of the *same* client, without trusting the source IP.
+  pub session_id: u128,
 }
 
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
@@ -24,7 +27,7 @@ pub enum ClientControlMessage {
 #[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 pub enum ServerAckMessage {
   /// Acknowledgment for service registration
-  ServiceRegistered { service_name: String, success: bool, error: Option<String> },
+  ServiceRegistered { service_name: String, remote_port: u16, success: bool, error: Option<String> },
   /// Acknowledgment for service unregistration
   ServiceUnregistered { service_name: String, success: bool, error: Option<String> },
 }
@@ -111,7 +114,7 @@ mod tests {
     // The largest payload that fits must survive the u16 length prefix.
     let hello = (0..MAX_FRAME_LEN)
       .rev()
-      .map(|n| ClientHello { token: Some("x".repeat(n)) })
+      .map(|n| ClientHello { token: Some("x".repeat(n)), session_id: u128::MAX })
       .find(|hello| bitcode::encode(hello).len() <= MAX_FRAME_LEN)
       .unwrap();
     assert!(bitcode::encode(&hello).len() > MAX_FRAME_LEN - 8);
@@ -123,7 +126,7 @@ mod tests {
 
   #[tokio::test]
   async fn frame_over_max_len_rejected() {
-    let hello = ClientHello { token: Some("x".repeat(MAX_FRAME_LEN + 1)) };
+    let hello = ClientHello { token: Some("x".repeat(MAX_FRAME_LEN + 1)), session_id: 0 };
     assert!(write_frame(&mut Vec::new(), &hello).await.is_err());
   }
 
