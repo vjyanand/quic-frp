@@ -5,10 +5,12 @@
 //! - `registry`: which connection owns which public port
 //! - `listener`: public TCP listeners and the QUIC stream opened per TCP connection
 //! - `transport`: QUIC transport and UDP socket configuration
+//! - `tls`: server certificate
 
 mod connection;
 mod listener;
 mod registry;
+mod tls;
 mod transport;
 
 use std::{net::SocketAddr, sync::Arc};
@@ -16,8 +18,9 @@ use std::{net::SocketAddr, sync::Arc};
 use quinn::{Endpoint, EndpointConfig, ServerConfig, crypto::rustls::QuicServerConfig, default_runtime};
 use tracing::{debug, info, warn};
 
-use crate::tls::{self, TlsServerCertConfig};
+use crate::shared::protocol;
 use registry::PortRegistry;
+use tls::TlsServerCertConfig;
 
 pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<()> {
   info!("server starting on {}", config.listen_addr);
@@ -27,7 +30,7 @@ pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<(
     _ => TlsServerCertConfig::self_signed(vec!["localhost"]).into_server_config()?,
   };
 
-  let alpn = tls::alpn();
+  let alpn = protocol::alpn();
   server_crypto.alpn_protocols = vec![alpn.into()];
   let server_crypto = Arc::new(QuicServerConfig::try_from(server_crypto)?);
 

@@ -196,11 +196,10 @@ Source layout:
 
 | Path | Purpose |
 |------|---------|
-| `src/client.rs` | Client: connect, register services, hot reload, serve data streams |
-| `src/server/` | Server: `connection` (auth, control), `registry` (port ownership), `listener` (public TCP ports), `transport` (QUIC/UDP setup) |
-| `src/proxy.rs` | TCP ⇄ QUIC forwarding and the compression framing, shared by both sides |
-| `src/protocol.rs` | Control messages, frame and stream-header encoding |
-| `src/tls.rs` | Certificates, client verification modes, ALPN |
+| `src/main.rs`, `src/cli.rs`, `src/config.rs` | Entry point, CLI, config file parsing |
+| `src/client/` | `transport` (resolve + connect), `session` (control stream, registration retries), `reload` (hot reload), `streams` (data streams to local services), `tls` (server verification), `backoff` |
+| `src/server/` | `connection` (auth, control), `registry` (port ownership), `listener` (public TCP ports), `transport` (QUIC/UDP setup), `tls` (server certificate) |
+| `src/shared/` | `protocol` (messages, framing, ALPN), `proxy` (TCP ⇄ QUIC forwarding, compression), `tls` (PEM loading) |
 | `src/e2e_tests.rs` | End-to-end tests running server and client over loopback |
 
 ## Troubleshooting

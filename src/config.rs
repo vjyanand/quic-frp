@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-use crate::tls::TlsClientCertConfig;
+use crate::client::TlsClientCertConfig;
 
 pub const VERSION_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
 

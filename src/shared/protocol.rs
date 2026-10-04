@@ -1,7 +1,17 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace};
 
-use crate::config::ServiceDefinition;
+use crate::config::{ServiceDefinition, VERSION_MAJOR};
+
+/// Wire protocol revision. Bump on any incompatible framing change so mismatched
+/// peers fail at the handshake instead of mid-stream.
+/// 2: token moved from ALPN into `ClientHello`; data stream header carries compression flag.
+const PROTOCOL_REVISION: u8 = 2;
+
+/// ALPN both ends must agree on; encodes the crate major version and protocol revision.
+pub fn alpn() -> String {
+  format!("quic-proxy-{}-r{}", VERSION_MAJOR, PROTOCOL_REVISION)
+}
 
 const MAX_FRAME_LEN: usize = u16::MAX as usize;
 

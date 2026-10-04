@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
   config::ServiceDefinition,
-  protocol::{ClientControlMessage, ClientHello, ServerAckMessage, constant_time_eq, read_frame, write_frame},
+  shared::protocol::{ClientControlMessage, ClientHello, ServerAckMessage, constant_time_eq, read_frame, write_frame},
 };
 
 /// How long a new connection has to send its `ClientHello`.

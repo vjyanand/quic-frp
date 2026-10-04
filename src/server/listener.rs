@@ -11,8 +11,8 @@ use tracing::{debug, info, warn};
 
 use crate::{
   config::ServiceDefinition,
-  protocol::{StreamHeader, write_stream_header},
-  proxy::proxy,
+  shared::protocol::{StreamHeader, write_stream_header},
+  shared::proxy::proxy,
 };
 
 /// Bind the service's public port, retrying briefly: on a stale-connection takeover the
