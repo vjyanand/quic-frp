@@ -1,17 +1,16 @@
 # quic-frp
 
-A fast, lightweight reverse proxy built on QUIC protocol for exposing local services behind NAT or firewall to the internet. Similar to [rathole](https://github.com/rapiz1/rathole) but uses QUIC for the tunnel transport.
+A lightweight reverse proxy that exposes TCP services behind NAT or a firewall through a public server, using QUIC as the tunnel transport. Similar to [rathole](https://github.com/rapiz1/rathole) / [frp](https://github.com/fatedier/frp), but every proxied connection is a stream on one multiplexed QUIC connection.
 
 ## Features
 
-- **QUIC Transport**: Multiplexed streams over a single UDP connection with built-in encryption
-- **NAT Traversal**: Client initiates connection, allowing services behind NAT/firewall to be exposed
-- **Authentication**: Token-based and TLS certificate-based client authentication
-- **Hot Reload**: Client configuration can be modified at runtime - services are automatically registered/unregistered
-- **Connection Multiplexing**: All TCP connections share a single QUIC connection, reducing overhead
-- **Auto-Reconnect**: Client automatically reconnects with exponential backoff on connection loss
-- **Zero-Copy Design**: Efficient data forwarding using shared references and lock-free data structures
-- **Graceful Cleanup**: Proper resource cleanup when connections drop or services are unregistered
+- **QUIC transport**: one UDP connection carries all services and TCP connections, with TLS 1.3 built in
+- **NAT traversal**: the client dials out, so services behind NAT/firewalls can be exposed
+- **Token authentication**: checked after the TLS handshake, never sent in cleartext
+- **Hot reload**: edit the client config while it runs; services are added, removed or updated live
+- **Auto-reconnect**: exponential backoff; a reconnecting client reclaims its ports from its stale connection
+- **Optional compression**: per-service snappy compression, skipped automatically for incompressible data
+- **IPv4 and IPv6** for both the tunnel and the public ports
 
 ## Architecture
 
@@ -42,16 +41,9 @@ A fast, lightweight reverse proxy built on QUIC protocol for exposing local serv
 └──────────────────────────────────────────────────────┘
 ```
 
-### Protocol Design
-
-- **Control Plane**: Long-lived bidirectional QUIC stream for service registration/unregistration
-- **Data Plane**: New QUIC stream opened for each proxied TCP connection
-- **Handshake**: First control frame is a `ClientHello` carrying the auth token (sent inside the encrypted QUIC connection, never in the TLS ClientHello) and a random per-process session id. A reconnect with the same session id takes over its ports from the stale connection; other clients (even from the same IP) are refused, and the client retries rejected registrations every 5s
-- **Framing**: 2-byte length prefix + bitcode payload for control messages; 3-byte header (port + compression flag) for data streams
-
 ## Installation
 
-### From Source
+Requires the Rust toolchain pinned in `rust-toolchain`.
 
 ```bash
 git clone https://github.com/vjyanand/quic-frp.git
@@ -59,325 +51,170 @@ cd quic-frp
 cargo build --release
 ```
 
-## Usage
+The same binary runs as server or client, depending on whether the config file has a `[server]` or `[client]` section:
 
-### Server Setup (Public VPS)
+```bash
+./quic-frp server.toml
+./quic-frp client.toml
+```
 
-#### Basic Configuration
+## Quick Start
 
-1. Create `server.toml`:
+**Server** (public host), `server.toml`:
 
 ```toml
 [server]
 listen_addr = "0.0.0.0:4433"
+token = "change-me-to-a-long-random-string"
 ```
 
-2. Run the server:
-
-```bash
-RUST_LOG=info ./quic-frp -c server.toml
-```
-
-The server will:
-- Listen on UDP port 4433 for QUIC connections from clients
-- Dynamically open TCP ports as clients register services
-
-#### With Token Authentication
-
-1. Create `server.toml`:
-
-```toml
-[server]
-listen_addr = "0.0.0.0:4433"
-token = "your-secret-token-here"
-```
-
-2. Run the server:
-
-```bash
-RUST_LOG=info ./quic-frp -c server.toml
-```
-
-#### With Custom TLS Certificates
-
-1. Create `server.toml`:
-
-```toml
-[server]
-listen_addr = "0.0.0.0:4433"
-cert = "/path/to/cert.pem"
-key = "/path/to/key.pem"
-token = "your-secret-token-here"  # Optional but recommended
-```
-
-2. Run the server:
-
-```bash
-RUST_LOG=info ./quic-frp -c server.toml
-```
-
-### Client Setup (Behind NAT)
-
-#### Basic Configuration
-
-1. Create `client.toml`:
+**Client** (behind NAT), `client.toml`:
 
 ```toml
 [client]
-remote_addr = "your-server.com:4433"
-prefer_ipv6 = false
-retry_interval = 5
+remote_addr = "your-server.example.com:4433"
+token = "change-me-to-a-long-random-string"
+
+# The server above uses a self-signed certificate, see "TLS" below.
+[client.tls]
+mode = "skip_verification"
 
 [[client.services]]
-service_name = "web"
+name = "web"
 local_addr = "127.0.0.1:8080"
 remote_port = 80
 
 [[client.services]]
-service_name = "ssh"
+name = "ssh"
 local_addr = "127.0.0.1:22"
 remote_port = 2222
-
-[[client.services]]
-service_name = "api"
-local_addr = "192.168.1.100:3000"
-remote_port = 3000
 ```
 
-2. Run the client:
+Connections to `your-server.example.com:80` now reach `127.0.0.1:8080` on the client machine, and port `2222` reaches its SSH server.
+
+Open UDP `4433` and each `remote_port` (TCP) in the server's firewall.
+
+## TLS
+
+Without `cert`/`key`, the server generates a fresh self-signed certificate (for `localhost`) at every start. Clients cannot verify it, so pick one of:
+
+| Server | Client `[client.tls]` | Notes |
+|--------|-----------------------|-------|
+| `cert` + `key` from a public CA (e.g. Let's Encrypt) | `mode = "system_root"` (default) | Recommended. The certificate must match the host in `remote_addr`, or set `server_name`. |
+| `cert` + `key`, your own CA or self-signed | `mode = "trust_cert"`, `cert_path = "/path/to/ca-or-cert.pem"` | Pin the certificate the server uses. |
+| No `cert`/`key` | `mode = "skip_verification"` | Encrypted but unauthenticated: vulnerable to man-in-the-middle. Rely on the token and use it for testing only. |
+
+Generate a self-signed certificate for `trust_cert`:
 
 ```bash
-RUST_LOG=info ./quic-frp -c client.toml
+openssl req -x509 -newkey rsa:4096 -nodes -days 365 \
+  -keyout key.pem -out cert.pem -subj "/CN=your-server.example.com" \
+  -addext "subjectAltName=DNS:your-server.example.com"
 ```
-
-#### With Token Authentication
-
-1. Create `client.toml`:
-
-```toml
-[client]
-remote_addr = "your-server.com:4433"
-token = "your-secret-token-here"
-prefer_ipv6 = false
-retry_interval = 5
-
-[[client.services]]
-service_name = "web"
-local_addr = "127.0.0.1:8080"
-remote_port = 80
-compression = true
-```
-
-2. Run the client:
-
-```bash
-RUST_LOG=info ./quic-frp -c client.toml
-```
-
-#### With TLS Client Certificate
-
-1. Create `client.toml`:
-
-```toml
-[client]
-remote_addr = "your-server.com:4433"
-prefer_ipv6 = false
-retry_interval = 5
-
-[client.tls]
-cert = "/path/to/client-cert.pem"
-key = "/path/to/client-key.pem"
-
-[[client.services]]
-service_name = "web"
-local_addr = "127.0.0.1:8080"
-remote_port = 80
-```
-
-2. Run the client:
-
-```bash
-RUST_LOG=info ./quic-frp -c client.toml
-```
-
-The client will:
-- Connect to the server over QUIC
-- Authenticate using the configured token or certificate
-- Register all configured services
-- Forward incoming connections to local services
-
-### Hot Reload
-
-Modify `client.toml` while the client is running. Changes are automatically detected:
-
-- **Add service**: New TCP listener opens on server
-- **Remove service**: TCP listener closes on server
-- **Modify local_addr**: Future connections route to new address
-- **Modify compression / prefer_ipv6**: Service is re-registered on the server (open connections on that port are closed)
 
 ## Configuration Reference
 
-### Server Configuration
+### `[server]`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `listen_addr` | String | Yes | UDP address to listen on (e.g., `"0.0.0.0:4433"`) |
-| `token` | String | No | Shared secret token for client authentication |
-| `cert` | String | No | Path to TLS certificate file (PEM format) |
-| `key` | String | No | Path to TLS private key file (PEM format) |
+| `listen_addr` | String | Yes | UDP address for QUIC, e.g. `"0.0.0.0:4433"` or `"[::]:4433"` |
+| `token` | String | No | Shared secret clients must present. Without it, any client may register ports. |
+| `cert` | Path | No | Certificate chain (PEM). Needs `key`. |
+| `key` | Path | No | Private key (PEM). Needs `cert`. |
 
-### Client Configuration
+### `[client]`
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `remote_addr` | String | Yes | - | Server address (`"host:port"`) |
+| `remote_addr` | String | Yes | | Server address, `"host:port"` |
+| `token` | String | No | | Must match the server's `token` |
 | `server_name` | String | No | host of `remote_addr` | Name the server certificate is verified against |
-| `token` | String | No | - | Authentication token (must match server) |
-| `prefer_ipv6` | Boolean | No | `false` | Prefer IPv6 when resolving server address |
-| `retry_interval` | Integer | No | `5` | Initial retry interval in seconds |
-| `services` | Array | Yes | - | List of services to expose |
-| `tls` | Object | No | - | TLS client certificate configuration |
-| `compression` | Boolean | No | `false` | compress traffic / data plane |
+| `prefer_ipv6` | Bool | No | `false` | Use an IPv6 address when `remote_addr` resolves to both |
+| `retry_interval` | Integer | No | `5` | First reconnect delay in seconds; doubles per failure up to 30s |
+| `tls` | Table | No | `system_root` | See [TLS](#tls) |
+| `services` | Array | Yes | | Services to expose, see below |
 
-### TLS Client Certificate Configuration
+### `[[client.services]]`
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `cert` | String | Yes | Path to client certificate file (PEM format) |
-| `key` | String | Yes | Path to client private key file (PEM format) |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | String | Yes | | Label used in logs and acknowledgements |
+| `local_addr` | String | Yes | | Address the client forwards to, `"host:port"` |
+| `remote_port` | Integer | Yes | | Public TCP port opened on the server |
+| `compression` | Bool | No | `false` | Snappy-compress this service's traffic in the tunnel. Helps for text-heavy plain protocols; useless for TLS/SSH or already-compressed data. |
+| `prefer_ipv6` | Bool | No | `false` | Server listens on `[::]` instead of `0.0.0.0` for this port |
 
-### Service Definition
+## Hot Reload
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `service_name` | String | Yes | Human-readable name for logging |
-| `local_addr` | String | Yes | Local service address (`"host:port"`) |
-| `remote_port` | Integer | Yes | Public port on server |
-| `prefer_ipv6` | Boolean | No | Override global IPv6 preference for this service |
+The client watches its config file. On change:
+
+- **Service added**: registered and its port opened on the server
+- **Service removed**: unregistered and its port closed
+- **`local_addr` changed**: new connections go to the new address; open ones are untouched
+- **`compression`, `prefer_ipv6` or `name` changed**: the service is re-registered, which closes connections open on that port
+
+Connection settings (`remote_addr`, `token`, `tls`, …) need a client restart.
+
+## Reconnects and Port Ownership
+
+Each client process picks a random session id and sends it (with the token) when it connects. If the connection drops and the same process reconnects, even from a different IP, it takes its ports back from the stale connection immediately.
+
+A *different* process asking for a port that is still held, for example a restarted client while its old connection has not yet timed out (about 10s), is refused. The client retries refused registrations every 5 seconds, so the service comes back on its own. Two clients configured with the same `remote_port` do not steal from each other: the second keeps logging a conflict.
 
 ## Logging
 
-Control log verbosity with `RUST_LOG` environment variable:
+The default level is `info`. Override it with `RUST_LOG`:
 
 ```bash
-# Minimal logging
-RUST_LOG=warn ./quic-frp -c (client|server).toml
-
-# Standard logging
-RUST_LOG=info ./quic-frp -c (client|server).toml
-
-# Debug logging
-RUST_LOG=debug ./quic-frp -c (client|server).toml
-
-# Trace logging (very verbose)
-RUST_LOG=trace ./quic-frp -c (client|server).toml
+RUST_LOG=debug ./quic-frp client.toml
+RUST_LOG=warn,quic_frp=info ./quic-frp server.toml
 ```
 
-## Security Considerations
+## Protocol
 
-- **TLS**: QUIC provides built-in TLS 1.3 encryption for all traffic
-- **Authentication**: Use token-based or certificate-based authentication to prevent unauthorized clients
-- **Self-Signed Certificates**: Server generates self-signed certificates by default. For production, use proper certificates via the `cert` and `key` options
-- **Token Security**: Choose a strong, random token and keep it secret. The token is sent after the TLS handshake completes, so it is encrypted on the wire and compared in constant time
-- **Firewall**: Only expose necessary ports on the server (UDP port for QUIC, TCP ports for services)
-- **Network Trust**: Even with authentication, ensure your server is properly secured and monitored
+Not compatible across protocol revisions. Client and server must be built from the same revision (enforced through ALPN `quic-proxy-<major>-r<revision>`).
 
-### Generating TLS Certificates
+- **Control stream**: opened by the client. Frames are a 2-byte big-endian length followed by a [bitcode](https://github.com/SoftbearStudios/bitcode) payload (max 65535 bytes). The first frame is `ClientHello { token, session_id }`, then `RegisterService` / `DeregisterService` requests, each answered by an acknowledgement.
+- **Data streams**: one per public TCP connection, opened by the server. A 3-byte header (port, compression flag) is followed by the raw bytes or, with compression, by frames `[kind: u8][len: u32][payload]` where each frame carries at most 64 KiB of original data, snappy-compressed or raw if it would not shrink.
 
-For production use with custom certificates:
+## Security Notes
+
+- Use a long random `token`: it is the only thing stopping anyone from opening ports on your server.
+- Prefer a CA-signed or pinned certificate over `skip_verification`, which allows a man-in-the-middle to capture the token.
+- Only `remote_port`s registered by clients are opened, but they listen on all interfaces. Firewall the server accordingly.
+
+## Development
 
 ```bash
-# Generate a self-signed certificate (for testing)
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
-
-# Generate client certificate (for mutual TLS)
-openssl req -x509 -newkey rsa:4096 -keyout client-key.pem -out client-cert.pem -days 365 -nodes
+cargo test                                         # unit + loopback end-to-end tests
+cargo test --release bench_throughput -- --ignored --nocapture   # tunnel throughput benchmark
+cargo build --release --features hotpath           # build with hotpath profiling
 ```
 
-For production, obtain certificates from a trusted Certificate Authority (CA) like Let's Encrypt.
+Source layout:
 
-## Performance
-
-- **Multiplexing**: Single QUIC connection handles all services and connections
-- **Keep-Alive**: 5-second keep-alive prevents connection drops
-- **Lock-Free**: Uses `DashMap` for concurrent service registry access
-- **Zero-Copy**: Efficient stream forwarding without unnecessary allocations
-- **Async Runtime**: Built on Tokio for high-performance async I/O
-
-## Work in Progress
-
-> ⚠️ **This project is under active development. The following features are planned or in progress:**
-
-### Planned Features
-- [ ] **Connection Pooling**: Reuse QUIC streams for better performance
-- [ ] **Metrics/Monitoring**: Prometheus metrics endpoint
-
-## Comparison with Alternatives
-
-| Feature | quic-frp | rathole | frp |
-|---------|------------|---------|-----|
-| Transport | QUIC | TCP/TLS | TCP/KCP/QUIC |
-| Multiplexing | Native | Manual | Manual |
-| Hot Reload | ✓ | ✓ | ✓ |
-| Token Auth | ✓ | ✓ | ✓ |
-| TLS Cert Auth | ✓ | ✗ | ✗ |
-| HTTP Features | ✗ | ✗ | ✓ |
-| Complexity | Low | Low | High |
+| Path | Purpose |
+|------|---------|
+| `src/client.rs` | Client: connect, register services, hot reload, serve data streams |
+| `src/server/` | Server: `connection` (auth, control), `registry` (port ownership), `listener` (public TCP ports), `transport` (QUIC/UDP setup) |
+| `src/proxy.rs` | TCP ⇄ QUIC forwarding and the compression framing, shared by both sides |
+| `src/protocol.rs` | Control messages, frame and stream-header encoding |
+| `src/tls.rs` | Certificates, client verification modes, ALPN |
+| `src/e2e_tests.rs` | End-to-end tests running server and client over loopback |
 
 ## Troubleshooting
 
-### Authentication Failed
+**Client keeps reconnecting with `unauthorized`**: the `token` differs between client and server.
 
-- Ensure the `token` matches exactly on both client and server
-- If using client certificates, verify the cert and key paths are correct
-- Check that certificate files are readable by the process
+**`invalid peer certificate` / `UnknownIssuer`**: the client cannot verify the server certificate. See [TLS](#tls); for a self-signed server use `trust_cert` or `skip_verification`.
 
-### Connection Refused
+**`registration failed … port N conflict`**: another client (or an older connection of this one that has not timed out yet) owns the port. Wait for the retry, or change `remote_port`.
 
-- Ensure server is running and UDP port 4433 is open
-- Check firewall rules on both server and client
-- Verify the server address is correct in client config
+**`registration failed … failed to bind`**: the port is in use by another program on the server, or is privileged (< 1024) and the server lacks permission.
 
-### Service Not Accessible
-
-- Verify local service is running on configured `local_addr`
-- Check server logs for TCP listener binding errors
-- Ensure `remote_port` is not already in use on server
-- Confirm authentication is successful (check logs)
-
-### Frequent Reconnections
-
-- Increase `retry_interval` in client config
-- Check network stability
-- Review server logs for connection errors
-- Verify authentication credentials are correct
-
-### Certificate Errors
-
-- Ensure certificate and key files are in PEM format
-- Check file permissions on certificate/key files
-- Verify certificate hasn't expired
-- For client certificates, ensure they're properly signed
-
-## Dependencies
-
-- [tokio](https://github.com/tokio-rs/tokio) - Async runtime
-- [quinn](https://github.com/quinn-rs/quinn) - QUIC implementation in Rust
-- [dashmap](https://github.com/xacrimon/dashmap) - Lock-free concurrent hashmap
-- [bitcode](https://github.com/SoftbearStudios/bitcode) - Binary serialization
-- [notify](https://github.com/notify-rs/notify) - File system watcher for hot reload
-- [rustls](https://github.com/rustls/rustls) - Modern TLS library
+**Port open but connections close immediately**: the client cannot reach `local_addr`. Check the service is running and `RUST_LOG=debug` client logs.
 
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues and pull requests.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
